@@ -155,9 +155,15 @@ SORGU (online):
 
 MODEL YAŞAM DÖNGÜSÜ (16GB):
   parse → unload → embed → query. Asla aynı anda iki ağır model yok.
-  qwen2.5:7b Q4 (~4.7GB) + nomic-embed (~0.3GB) → 16GB'a rahat sığar.
+  qwen3:8b Q4 (~5GB) + bge-m3/nomic embed → 16GB'a sığar.
   Chandra (opsiyonel) yalnız parse fazında, sonra unload.
 ```
+
+**Model rolleri (karar 2026-06-14):**
+- **Navigasyon + sentez (online, varsayılan):** `qwen3:8b` (thinking modu navigasyona birebir). qwen2.5:7b'den yükseltildi.
+- **Özet üretimi (offline, çok çağrı):** küçük/hızlı model (`qwen3:4b` / `qwen2.5:3b`) — opsiyonel optimizasyon.
+- **Embedding:** `bge-m3` (çok dilli/Türkçe avantajı) değerlendirilecek, alternatif `nomic-embed-text`.
+- Mimari **model-agnostik** olmalı: model tek `config.py` satırından değişebilir (Qwen/Llama/Gemma fark etmez).
 
 ### 6.5. Önce Yapılacak Retrieval Düzeltmeleri (mevcut koda)
 
@@ -172,3 +178,59 @@ Mimariye geçmeden mevcut retrieval'ı sağlamlaştıran hızlı kazanımlar (de
 - Çoklu belge üzerinde cross-document sorgu kapsama dahil mi?
 - Ağaç özetlerini hangi modelle üretelim (qwen2.5:7b yeterli mi, yoksa daha küçük hızlı bir model mi)?
 - Recursive descent'te "yanlış dala saparsa" geri dönüş (backtrack) stratejisi.
+
+### 6.7. Veri Modeli (koddan önceki son tasarım parçası)
+
+İki depo, tek köprü: **`toc_nodes.node_id` ↔ `chunk.metadata.node_id`**. İç düğümler yalnız özet (navigasyon tabelası), yapraklar tam metin (vektörlenir).
+
+**SQLite — `toc_nodes` (yeni şema; `toc_links` KALDIRILDI):**
+```sql
+CREATE TABLE toc_nodes (
+  id          INTEGER PRIMARY KEY,
+  document_id INTEGER NOT NULL,
+  node_id     INTEGER NOT NULL,   -- belge içi kimlik
+  parent_id   INTEGER,            -- üst düğümün node_id'si (descent burada gezer)
+  heading     TEXT NOT NULL,
+  level       INTEGER NOT NULL,
+  path        TEXT NOT NULL,      -- "2. Yöntem > 2.2 Veri Temizleme" (alıntı için)
+  is_leaf     INTEGER NOT NULL,   -- 0 = iç düğüm, 1 = yaprak
+  summary     TEXT,               -- LLM özeti — TÜM düğümlerde
+  content     TEXT,               -- tam metin — YALNIZ yaprakta (iç düğümde NULL)
+  start_page  INTEGER,            -- alıntı/traceability
+  end_page    INTEGER,
+  token_count INTEGER,            -- yaprak bütçeleme
+  FOREIGN KEY (document_id) REFERENCES documents(id)
+);
+CREATE INDEX idx_nodes_parent ON toc_nodes(document_id, parent_id); -- hızlı çocuk getir
+CREATE INDEX idx_nodes_doc    ON toc_nodes(document_id, node_id);
+```
+Not: İç düğümün başlık-altı "preamble" metni kaybolmasın diye, varsa sanal bir yaprak çocuğa ("X (giriş)") taşınır → "yalnız yaprak vektörlenir" kuralı korunur, bilgi kaybı olmaz.
+
+**ChromaDB — `aegis_leaf_chunks` (yalnız yapraklar):**
+- `get_or_create_collection(..., metadata={"hnsw:space": "cosine"})` ← mevcut bug fix.
+- chunk id: `doc_{did}_node_{nid}_p_{idx}`
+- metadata: `{document_id, node_id, path, heading, start_page}`
+- embed: `bge-m3`/`nomic`, task prefix'leriyle (`search_document:` / `search_query:`).
+
+**Tek yeni süper güç — kapsamlı (scoped) sorgu:**
+```python
+# Yaprak-içi arama (recursive descent seçtikten SONRA):
+col.query(query_texts=[f"search_query: {q}"], n_results=5,
+          where={"$and":[{"document_id":did},{"node_id":{"$in": leaf_ids}}]})
+# Güvenlik ağı (descent boş dönerse): tüm yapraklarda global arama:
+col.query(query_texts=[f"search_query: {q}"], n_results=5, where={"document_id":did})
+```
+Mevcut kod yalnız `document_id`'ye filtreliyordu; yeni yetenek **`node_id ∈ {seçilen yapraklar}`** ile aramayı seçilen alt-ağaca daraltmak.
+
+**config.py (sabitler tek yerde, model-agnostik):**
+```python
+LLM_MODEL       = "qwen3:8b"   # navigasyon (thinking on) + sentez (thinking off)
+SUMMARY_MODEL   = "qwen3:4b"   # offline özet (opsiyonel hız optimizasyonu)
+EMBED_MODEL     = "bge-m3"     # alternatif: nomic-embed-text
+MAX_TREE_DEPTH  = 6
+MAX_LEAVES      = 3
+MAX_DESCENT_CALLS = 8
+TOKEN_BUDGET    = 4000
+```
+
+**Migration:** `db/` gitignore'da ve dev verisi → şema değişince eski db silinip yeniden indekslenir (`db/aegis_rag.db` + `db/chroma_db/` sil), veya `SCHEMA_VERSION` sabiti uyuşmazsa tablolar otomatik yeniden kurulur.
