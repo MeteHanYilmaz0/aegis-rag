@@ -1,0 +1,61 @@
+import unittest
+import os
+import sys
+
+# Proje kök dizinini Python yoluna ekleyelim
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from src.parser.toc_extractor import TOCExtractor
+
+class TestTOCExtractor(unittest.TestCase):
+    def setUp(self):
+        self.sample_markdown = """# Bölüm 1: Giriş
+Bu birinci bölümün ilk paragrafıdır.
+
+## Alt Bölüm 1.1: Amaç
+Bu alt bölümün amacı RAG sistemini doğrulamaktır.
+
+## Alt Bölüm 1.2: Kapsam
+Bu alt bölümün kapsamı yerel ağaç tabanlı aramadır.
+
+### Detay 1.2.1: Algoritma
+Burada hiyerarşik PageIndex algoritması detaylandırılmıştır.
+
+# Bölüm 2: Metot ve Sonuçlar
+İkinci ana bölümün içeriğidir.
+"""
+
+    def test_extract_toc_tree_count(self):
+        nodes = TOCExtractor.extract_toc_tree(self.sample_markdown)
+        # Toplam düğüm sayısı: H1(Giriş), H2(Amaç), H2(Kapsam), H3(Algoritma), H1(Metot) = 5
+        self.assertEqual(len(nodes), 5)
+
+    def test_extract_toc_tree_hierarchy(self):
+        nodes = TOCExtractor.extract_toc_tree(self.sample_markdown)
+        
+        # Giriş başlığı seviye 1 olmalı
+        self.assertEqual(nodes[0]["heading"], "Bölüm 1: Giriş")
+        self.assertEqual(nodes[0]["level"], 1)
+        self.assertIsNone(nodes[0]["parent_id"])
+        
+        # Amaç başlığı seviye 2 olmalı ve parent olarak Giriş'e bağlı olmalı
+        self.assertEqual(nodes[1]["heading"], "Alt Bölüm 1.1: Amaç")
+        self.assertEqual(nodes[1]["level"], 2)
+        self.assertEqual(nodes[1]["parent_id"], nodes[0]["id"])
+        self.assertEqual(nodes[1]["path"], "Bölüm 1: Giriş > Alt Bölüm 1.1: Amaç")
+        
+        # Detay 1.2.1 başlığı seviye 3 olmalı ve parent olarak Kapsam'a bağlı olmalı
+        self.assertEqual(nodes[3]["heading"], "Detay 1.2.1: Algoritma")
+        self.assertEqual(nodes[3]["level"], 3)
+        self.assertEqual(nodes[3]["parent_id"], nodes[2]["id"])
+        self.assertEqual(nodes[3]["path"], "Bölüm 1: Giriş > Alt Bölüm 1.2: Kapsam > Detay 1.2.1: Algoritma")
+
+    def test_extract_toc_tree_content(self):
+        nodes = TOCExtractor.extract_toc_tree(self.sample_markdown)
+        
+        # İçerik eşleşmelerini kontrol et
+        self.assertIn("ilk paragrafıdır", nodes[0]["content"])
+        self.assertIn("PageIndex algoritması", nodes[3]["content"])
+
+if __name__ == "__main__":
+    unittest.main()

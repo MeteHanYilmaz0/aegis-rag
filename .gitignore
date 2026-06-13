@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Aegis RAG verileri (yerel, paylaşılmaz)
+db/
+uploads/
+*.log
+
+# Üretilen raporlar
+aegis_benchmark_report.md
+
+# OS / editör
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
