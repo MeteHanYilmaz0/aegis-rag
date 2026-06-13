@@ -17,7 +17,7 @@ Tüm komutlar proje kök dizininden (`src/`'nin bulunduğu yer) çalıştırıl�
 pip install -r requirements.txt
 
 # Ön koşul: Ollama çalışıyor olmalı + gerekli modeller çekilmiş olmalı
-ollama pull qwen2.5:7b-instruct      # LLM (akıl yürütme/routing/NLI)
+ollama pull qwen3:8b                  # LLM (navigasyon/routing/sentez) — varsayılan
 ollama pull nomic-embed-text         # embedding modeli (ChromaDB)
 
 # Backend (port 8002 — README'deki 8000 GÜNCEL DEĞİL, kod 8002 kullanır)
@@ -70,4 +70,5 @@ Tek dosyalık Streamlit. Sol sütun: ısı haritalı/seçili-düğüm vurgulu TO
 - **`project_brain.md`** projenin merkezî hafızasıdır: tasarım kararları, çözülmüş üretim hataları ve yol haritası burada tutulur. Mimari değişikliklerde güncel tutulmalıdır.
 - **Git yok**: Proje versiyon kontrolünde değildir; bu yüzden geçmişte kök ve `aegis-rag/` altında **ayrışmış kopyalar** oluştu (temizlendi). Dosya kaybı riski yüksektir — `git init` önerilir.
 - **Eşzamanlılık**: `DBManager` tek SQLite bağlantısını (`check_same_thread=False`) tüm thread'lerde paylaşır; eşzamanlı yazma/okumada kilit riski vardır.
-- Sabitler dağınıktır (4000 token, 0.6/0.4 rerank ağırlıkları, model adları, port, top_k). Henüz merkezî bir config yoktur.
+- **Sabitler `src/config.py`'de toplanmıştır** (model adları, token bütçesi, rerank ağırlıkları, top_k, timeout'lar, ağaç parametreleri). `AEGIS_*` ortam değişkenleriyle ezilebilir. Yeni sabit eklerken buraya koy. Varsayılan LLM `qwen3:8b` (thinking kapalı — `config.LLM_THINKING`).
+- **Embedding:** `db_manager.OllamaEmbedder` fail-fast (Ollama yoksa sessizce yedeklenmez, hata fırlatır) ve nomic için `search_query:`/`search_document:` ön-eki uygular. ChromaDB koleksiyonu **cosine** uzaylıdır; eski L2 koleksiyon bulunursa otomatik yeniden oluşturulur (belgeleri yeniden indekslemek gerekir).

@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
+from src import config
 from src.parser.toc_extractor import TOCExtractor
 from src.database.db_manager import DBManager
 
@@ -31,33 +32,56 @@ app.add_middleware(
 db_manager = DBManager()
 
 # Ollama API URL
-OLLAMA_URL = "http://localhost:11434"
+OLLAMA_URL = config.OLLAMA_URL
 
 class QueryRequest(BaseModel):
     document_id: int
     query: str
-    model_name: str = "qwen2.5:7b-instruct"
+    model_name: str = config.LLM_MODEL
 
 def check_ollama_status() -> bool:
     """Ollama servisinin ayakta olup olmadığını kontrol eder."""
     try:
-        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2)
+        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=config.OLLAMA_HEALTH_TIMEOUT)
         return response.status_code == 200
     except Exception:
         return False
 
+def strip_think(text: str) -> str:
+    """Thinking modellerinin (qwen3 vb.) <think>...</think> bloklarını yanıttan ayıklar."""
+    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+def ollama_generate(model: str, prompt: str, temperature: Optional[float] = None,
+                    timeout: int = config.OLLAMA_GENERATE_TIMEOUT) -> str:
+    """
+    Ollama /api/generate çağrısı için tek giriş noktası.
+    Thinking'i kapatır (JSON/sentez yanıtını kirletmesin) ve <think> bloklarını ayıklar.
+    Hata durumunda istisna fırlatır; çağıran tarafta yakalanır.
+    """
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "think": config.LLM_THINKING,
+    }
+    if temperature is not None:
+        payload["options"] = {"temperature": temperature}
+    response = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=timeout)
+    response.raise_for_status()
+    return strip_think(response.json().get("response", ""))
+
 def clean_json_response(text: str) -> str:
-    """LLM'den gelen JSON yanıtı temizler."""
-    text = text.strip()
+    """LLM'den gelen JSON yanıtı temizler (önce olası <think> bloğunu ayıklar)."""
+    text = strip_think(text)
     match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1)
     return text
 
 def calculate_approx_tokens(text: str) -> int:
-    """Metnin yaklaşık token boyutunu hesaplar (Türkçe için kelime * 1.35)."""
+    """Metnin yaklaşık token boyutunu hesaplar (Türkçe için kelime * oran)."""
     words = len(text.split())
-    return int(words * 1.35)
+    return int(words * config.TOKEN_PER_WORD)
 
 def lexical_semantic_rerank(query: str, candidates: List[Dict[str, Any]], top_k: int = 3) -> List[Dict[str, Any]]:
     """
@@ -80,9 +104,12 @@ def lexical_semantic_rerank(query: str, candidates: List[Dict[str, Any]], top_k:
         overlap = query_terms.intersection(doc_words_set)
         lexical_score = len(overlap) / len(query_terms) if query_terms else 0.0
         
-        # Hibrit Skor Formülü
-        # %60 Cosine Semantik Benzerlik + %40 Lexical Çakışma Skoru
-        cand["hybrid_score"] = round(0.6 * cand["similarity"] + 0.4 * lexical_score, 4)
+        # Hibrit Skor Formülü (ağırlıklar config'ten)
+        cand["hybrid_score"] = round(
+            config.RERANK_COSINE_WEIGHT * cand["similarity"]
+            + config.RERANK_LEXICAL_WEIGHT * lexical_score,
+            4,
+        )
         
     # Hibrit skora göre yeniden sırala
     reranked = sorted(candidates, key=lambda x: x["hybrid_score"], reverse=True)
@@ -94,7 +121,7 @@ def health_check():
     ollama_ok = False
     models = []
     try:
-        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=2.5)
+        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=config.OLLAMA_HEALTH_TIMEOUT)
         if response.status_code == 200:
             ollama_ok = True
             models = [m["name"] for m in response.json().get("models", [])]
@@ -288,11 +315,11 @@ def query_aegis(payload: QueryRequest):
     # ==========================================
     # 2. KATMAN: Çift Hatlı Arama & Kesişim (Heatmap)
     # ==========================================
-    # ChromaDB semantik arama (Top-10 aday)
-    semantic_raw = db_manager.query_chroma(document_id, query, top_k=10)
-    
+    # ChromaDB semantik arama (ham adaylar)
+    semantic_raw = db_manager.query_chroma(document_id, query, top_k=config.SEMANTIC_TOP_K)
+
     # Lexical-Semantic Reranking Katmanı
-    reranked_hits = lexical_semantic_rerank(query, semantic_raw, top_k=5)
+    reranked_hits = lexical_semantic_rerank(query, semantic_raw, top_k=config.RERANK_TOP_K)
     
     # Isı haritasını (Heatmap) hesapla
     heatmap_scores = {}
@@ -346,33 +373,20 @@ JSON FORMATI:
 }}
 """
         try:
-            r_res = requests.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": model_name,
-                    "prompt": routing_prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.0}
-                },
-                timeout=25
-            )
-            
-            if r_res.status_code == 200:
-                raw_json = clean_json_response(r_res.json().get("response", ""))
-                route_data = json.loads(raw_json)
-                
-                selected_node_ids = route_data.get("selected_node_ids", [])
-                confidence = route_data.get("confidence", "MEDIUM")
-                reason = route_data.get("reason", "")
-                
-                # Uncertainty-Aware Routing: Güven skoru LOW ise doğrudan fallback
-                if confidence == "LOW" or not selected_node_ids:
-                    fallback_triggered = True
-                    trace.append("⚠️ **Uncertainty-Aware Tetiklendi:** Güven düzeyi Düşük (LOW). Yönlendirme devre dışı bırakılarak doğrudan Fallback moduna geçiliyor.")
-                else:
-                    trace.append(f"🎯 **Yönlendirme Başarılı:** Seçilen Düğümler: {selected_node_ids} (Gerekçe: {reason})")
-            else:
+            raw_response = ollama_generate(model_name, routing_prompt, temperature=0.0)
+            raw_json = clean_json_response(raw_response)
+            route_data = json.loads(raw_json)
+
+            selected_node_ids = route_data.get("selected_node_ids", [])
+            confidence = route_data.get("confidence", "MEDIUM")
+            reason = route_data.get("reason", "")
+
+            # Uncertainty-Aware Routing: Güven skoru LOW ise doğrudan fallback
+            if confidence == "LOW" or not selected_node_ids:
                 fallback_triggered = True
+                trace.append("⚠️ **Uncertainty-Aware Tetiklendi:** Güven düzeyi Düşük (LOW). Yönlendirme devre dışı bırakılarak doğrudan Fallback moduna geçiliyor.")
+            else:
+                trace.append(f"🎯 **Yönlendirme Başarılı:** Seçilen Düğümler: {selected_node_ids} (Gerekçe: {reason})")
         except Exception as e:
             fallback_triggered = True
             trace.append(f"⚠️ **Yönlendirme Hatası:** {str(e)}. Fallback aktif.")
@@ -383,7 +397,7 @@ JSON FORMATI:
     # 4. KATMAN: Context Economy & Token Budgeting (Bağlam Bütçeleme)
     # ==========================================
     context_blocks = []
-    total_token_budget = 4000 # Maksimum güvenli sınır
+    total_token_budget = config.TOKEN_BUDGET # Maksimum güvenli sınır
     current_token_count = 0
     
     if not fallback_triggered and selected_node_ids:
@@ -469,19 +483,9 @@ KURALLAR:
 
     answer = "Cevap oluşturulamadı."
     try:
-        qa_response = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": model_name,
-                "prompt": qa_prompt,
-                "stream": False
-            },
-            timeout=50
-        )
-        
-        if qa_response.status_code == 200:
-            candidate_answer = qa_response.json().get("response", "").strip()
-            
+        candidate_answer = ollama_generate(model_name, qa_prompt).strip()
+
+        if candidate_answer:
             # Local NLI-style Consistency Heuristic (Self-Reflection Check)
             nli_prompt = f"""
 Sana bir bağlam ve bu bağlama göre üretilmiş bir yapay zeka cevabı verilecek.
@@ -497,19 +501,11 @@ KURALLAR:
 1. Eğer cevap bağlamla tamamen uyumluysa ve uydurma bilgi içermiyorsa kelimesi kelimesine sadece "CONSISTENT" yaz.
 2. Eğer cevapta bağlam dışı/çelişkili uydurma bir iddia varsa sadece "CONTRADICTION" yaz.
 """
-            nli_res = requests.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": model_name,
-                    "prompt": nli_prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.0}
-                },
-                timeout=25
-            )
-            
-            nli_status = nli_res.json().get("response", "").strip() if nli_res.status_code == 200 else "CONSISTENT"
-            
+            try:
+                nli_status = ollama_generate(model_name, nli_prompt, temperature=0.0).strip()
+            except Exception:
+                nli_status = "CONSISTENT"
+
             if "CONTRADICTION" in nli_status:
                 trace.append("⚠️ **Local NLI Tutarlılık Süzgeci:** Çelişki/Uydurma şüphesi tespit edildi. Güvenli filtreleme uygulanıyor.")
                 # Çelişkili cevaba bir uyarı notu ekleyelim
@@ -518,7 +514,7 @@ KURALLAR:
                 trace.append("🟢 **Local NLI Tutarlılık Süzgeci:** Yanıt bağlamla tutarlı bulundu (CONSISTENT).")
                 answer = candidate_answer
         else:
-            answer = "API yanıt hatası."
+            answer = "Model boş yanıt döndürdü."
     except Exception as e:
         answer = f"Sorgu işlenirken bir hata oluştu: {str(e)}"
         trace.append(f"❌ **Hata:** {str(e)}")

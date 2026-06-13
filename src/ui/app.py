@@ -247,13 +247,14 @@ with st.sidebar:
     st.markdown("---")
     
     st.markdown("##### Yapılandırma")
-    default_models = ["qwen2.5:7b-instruct", "qwen:7b", "llama3:latest"]
+    default_models = ["qwen3:8b", "qwen2.5:7b-instruct", "llama3:latest"]
     available_models_list = models if models else default_models
-    
+    preferred_model = "qwen3:8b"
+
     selected_model = st.selectbox(
         "Dil Modeli (LLM)",
         options=available_models_list,
-        index=0 if "qwen2.5:7b-instruct" not in available_models_list else available_models_list.index("qwen2.5:7b-instruct"),
+        index=available_models_list.index(preferred_model) if preferred_model in available_models_list else 0,
         help="Ollama üzerinde çalışan yerel akıl yürütme modeli."
     )
     

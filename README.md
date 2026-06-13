@@ -35,15 +35,16 @@ pip install -r requirements.txt
 
 ### 2. Ollama Kurulumu ve Model İndirme
 1. [Ollama.com](https://ollama.com) adresinden Ollama'yı yerel işletim sisteminize indirin ve kurun.
-2. Terminalden Qwen 3.6 veya Llama 3 modelini indirin:
+2. Terminalden varsayılan modeli ve embedding modelini indirin:
    ```bash
-   ollama pull qwen2.5:7b-instruct  # veya qwen3.6 modeli
+   ollama pull qwen3:8b
+   ollama pull nomic-embed-text
    ```
 
 ### 3. Uygulamayı Başlatma
 1. Backend sunucusunu başlatın:
    ```bash
-   uvicorn src.backend.main:app --reload --port 8000
+   uvicorn src.backend.main:app --reload --port 8002
    ```
 2. Arayüzü başlatın:
    ```bash

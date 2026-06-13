@@ -5,7 +5,8 @@ import re
 import requests
 from typing import List, Dict, Any, Optional
 import chromadb
-from chromadb.api.types import Documents, Embeddings, EmbeddingFunction
+
+from src import config
 
 # Projenin kök dizininde db klasörü oluşturma
 DB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "db"))
@@ -14,39 +15,44 @@ os.makedirs(DB_DIR, exist_ok=True)
 SQLITE_PATH = os.path.join(DB_DIR, "aegis_rag.db")
 CHROMA_PATH = os.path.join(DB_DIR, "chroma_db")
 
-class OllamaEmbeddingFunction(EmbeddingFunction):
+class OllamaEmbedder:
     """
-    Ollama üzerinden yerel 'nomic-embed-text' modelini kullanan ChromaDB Uyumlu Embedding Sınıfı.
-    Eğer Ollama kapalıysa veya model bulunamadıysa ChromaDB'nin varsayılan embedding yapısına yedeklenir.
+    Ollama yerel embedding modeli (varsayılan: nomic-embed-text).
+
+    FAIL-FAST: Ollama/model erişilemezse SESSİZCE başka bir modele yedeklenmez.
+    Sessiz yedekleme, farklı boyutlu/uzaylı vektörlerin aynı koleksiyona karışmasına
+    ve arama sonuçlarının anlamsızlaşmasına yol açar. Bunun yerine açık hata fırlatır.
+
+    Görev ön-ekleri (task prefix): nomic-embed-text, dokümanlar için "search_document:",
+    sorgular için "search_query:" ön-eki bekler; bu ön-ekler retrieval kalitesini belirgin
+    artırır. Ön-ek gerektirmeyen modellerde (bge-m3 vb.) boş bırakılır.
     """
-    def __init__(self, model_name: str = "nomic-embed-text", base_url: str = "http://localhost:11434"):
-        self.model_name = model_name
+
+    def __init__(self, model: str = config.EMBED_MODEL, base_url: str = config.OLLAMA_URL):
+        self.model = model
         self.base_url = base_url
-        self._fallback_fn = None
+        uses_prefix = model.startswith("nomic")
+        self.doc_prefix = "search_document: " if uses_prefix else ""
+        self.query_prefix = "search_query: " if uses_prefix else ""
 
-    def _get_fallback(self):
-        if self._fallback_fn is None:
-            from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
-            self._fallback_fn = DefaultEmbeddingFunction()
-        return self._fallback_fn
+    def _embed_one(self, text: str) -> List[float]:
+        response = requests.post(
+            f"{self.base_url}/api/embeddings",
+            json={"model": self.model, "prompt": text},
+            timeout=config.EMBED_TIMEOUT,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Embedding modeli '{self.model}' yanıt vermedi (HTTP {response.status_code}). "
+                f"Ollama çalışıyor mu ve `ollama pull {self.model}` yapıldı mı kontrol edin."
+            )
+        return response.json()["embedding"]
 
-    def __call__(self, input: Documents) -> Embeddings:
-        embeddings = []
-        try:
-            for text in input:
-                response = requests.post(
-                    f"{self.base_url}/api/embeddings",
-                    json={"model": self.model_name, "prompt": text},
-                    timeout=5
-                )
-                if response.status_code == 200:
-                    embeddings.append(response.json()["embedding"])
-                else:
-                    raise Exception(f"Ollama API Error: {response.status_code}")
-            return embeddings
-        except Exception:
-            fallback = self._get_fallback()
-            return fallback(input)
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return [self._embed_one(self.doc_prefix + t) for t in texts]
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embed_one(self.query_prefix + text)
 
 
 class DBManager:
@@ -59,13 +65,32 @@ class DBManager:
         self.sqlite_conn.row_factory = sqlite3.Row
         self._init_sqlite()
         
-        # ChromaDB yerel istemcisini başlat
+        # ChromaDB yerel istemcisini başlat. Embedding'leri Chroma'ya elle veriyoruz
+        # (query/doc ön-ekleri için), bu yüzden koleksiyona embedding_function bağlamıyoruz.
         self.chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-        self.embedding_fn = OllamaEmbeddingFunction()
-        self.chroma_collection = self.chroma_client.get_or_create_collection(
-            name="aegis_rag_chunks",
-            embedding_function=self.embedding_fn
+        self.embedder = OllamaEmbedder()
+        self.chroma_collection = self._get_cosine_collection()
+
+    def _get_cosine_collection(self):
+        """
+        Cosine mesafe uzaylı koleksiyonu döndürür.
+
+        ÖNEMLİ: ChromaDB varsayılanı L2'dir; L2 ile `similarity = 1 - distance` formülü
+        yanlış sonuç verir (mesafe 1'i aşar, benzerlik negatife/0'a kırpılır). Doğru
+        kosinüs benzerliği için koleksiyon `hnsw:space=cosine` ile oluşturulmalıdır.
+        Eski (L2) bir koleksiyon bulunursa, doğru benzerlik için yeniden oluşturulur —
+        bu durumda belgelerin yeniden indekslenmesi gerekir (dev verisi).
+        """
+        name = config.CHROMA_COLLECTION
+        col = self.chroma_client.get_or_create_collection(
+            name=name, metadata={"hnsw:space": "cosine"}
         )
+        if (col.metadata or {}).get("hnsw:space") != "cosine":
+            self.chroma_client.delete_collection(name)
+            col = self.chroma_client.get_or_create_collection(
+                name=name, metadata={"hnsw:space": "cosine"}
+            )
+        return col
 
     def _init_sqlite(self):
         """SQLite tablolarını ve graf ilişkilerini ilklendirir."""
@@ -203,15 +228,18 @@ class DBManager:
         
         if chroma_documents:
             total_chunks = len(chroma_documents)
-            batch_size = 10
+            batch_size = 16
             for i in range(0, total_chunks, batch_size):
                 batch_ids = chroma_ids[i:i+batch_size]
                 batch_docs = chroma_documents[i:i+batch_size]
                 batch_metas = chroma_metadatas[i:i+batch_size]
+                # Embedding'leri ön-ekli olarak elle hesapla (search_document: ...)
+                batch_embs = self.embedder.embed_documents(batch_docs)
                 self.chroma_collection.add(
                     ids=batch_ids,
                     documents=batch_docs,
-                    metadatas=batch_metas
+                    metadatas=batch_metas,
+                    embeddings=batch_embs
                 )
                 if progress_callback:
                     progress_callback(min(i + batch_size, total_chunks), total_chunks)
@@ -269,29 +297,41 @@ class DBManager:
         rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
-    def query_chroma(self, document_id: int, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+    def query_chroma(self, document_id: int, query: str,
+                     top_k: int = config.SEMANTIC_TOP_K,
+                     node_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
         """
         ChromaDB üzerinde anlamsal arama yapar.
-        Aramayı sadece ilgili document_id'ye göre filtreler.
+
+        - Varsayılan: aramayı yalnızca ilgili document_id'ye göre filtreler (global / güvenlik ağı).
+        - node_ids verilirse: aramayı yalnızca seçilen yaprak düğümlerine daraltır
+          (recursive descent sonrası "yaprak-içi" arama — bkz. project_brain.md §6.7).
         """
+        if node_ids:
+            where = {"$and": [{"document_id": document_id}, {"node_id": {"$in": list(node_ids)}}]}
+        else:
+            where = {"document_id": document_id}
+
+        query_embedding = self.embedder.embed_query(query)
         results = self.chroma_collection.query(
-            query_texts=[query],
+            query_embeddings=[query_embedding],
             n_results=top_k,
-            where={"document_id": document_id}
+            where=where
         )
-        
+
         parsed_results = []
         if results and results["documents"] and len(results["documents"][0]) > 0:
             for idx in range(len(results["documents"][0])):
-                distance = results["distances"][0][idx] if "distances" in results and results["distances"] else 0.0
-                similarity = round(1.0 - distance, 4) if distance <= 1.0 else 0.0
-                
+                distance = results["distances"][0][idx] if results.get("distances") else 0.0
+                # Cosine uzayı: distance = 1 - kosinüs_benzerliği. Benzerlik [0,1]'e kırpılır.
+                similarity = max(0.0, round(1.0 - distance, 4))
+
                 parsed_results.append({
                     "content": results["documents"][0][idx],
                     "metadata": results["metadatas"][0][idx],
                     "similarity": similarity
                 })
-        
+
         return parsed_results
 
     def delete_document(self, document_id: int):
