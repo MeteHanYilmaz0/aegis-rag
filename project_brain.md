@@ -94,3 +94,81 @@ Tüm sistem bileşenlerinin hız bütçesini, arama isabetini ve sıkıştırma 
 python tests/benchmark_suite.py
 ```
 Bu komut, yerel donanımda izole testleri koşturacak ve performans raporunu güncelleyecektir.
+
+---
+
+## 🧬 6. Mimari Evrim Planı v2: Local PageIndex + RAG Füzyonu
+
+> **Durum:** Tasarım (2026-06-14). Henüz uygulanmadı. Bu bölüm, projenin yön değişimini ve hedef mimariyi tanımlar. Mevcut kod (`main.py` routing + ChromaDB fallback) bu mimarinin kabasına sahiptir; bu bir **sıfırdan yazım değil, refactor**'dur.
+
+### 6.1. Vizyon ve Boşluk Analizi
+
+**Amaç:** İki teknolojinin güçlü yanlarını **tam yerel** ve **min 16GB RAM** kısıtında birleştirmek:
+
+| Teknoloji | Güçlü yanı | Zayıf yanı (bizim çözdüğümüz) |
+|---|---|---|
+| **PageIndex** ([repo](https://github.com/VectifyAI/PageIndex)) | Hiyerarşik ağaç + akıl yürütme tabanlı navigasyon ("similarity ≠ relevance"), izlenebilir alıntılar | **Tam local değil** — LLM API key gerektirir (varsayılan GPT-4o). "No Vector DB" katı duruşu. |
+| **Açık kaynak RAG** | Tam local, ucuz, ince taneli pasaj bulma | Düz chunk + saf benzerlik; yapı/bağlam kaybı |
+| **Chandra** ([repo](https://github.com/datalab-to/chandra)) | Layout/tablo/matematik/el yazısı duyarlı yüksek kalite parse | **9B VLM, ~18GB BF16, resmî H100 önerisi.** Quantized GGUF var ama GPU'suz çok yavaş. |
+
+**Sonuç:** "Local PageIndex" gerçek bir boşluktur. Çözümümüz = ağacın akıl yürütmesi + vektörün ince aramasını **iki aşamalı** birleştirmek; ağır parser'ı **opsiyonel** tutmak.
+
+### 6.2. Temel Tasarım Kararları
+
+1. **Katmanlı (pluggable) parser** — tek bir modele kilitlenme:
+   - **Hızlı kat (varsayılan):** PyMuPDF (mevcut) — dijital/temiz PDF, anında.
+   - **İyi kat:** Docling / Marker — yapı+tablo kalitesi yüksek, local, makul ağırlık.
+   - **En iyi kat (opsiyonel):** Chandra — yalnız taranmış/el yazısı/karmaşık tablo-matematik için; local quantized **veya** Datalab API seçeneğiyle. **Zorunlu değil** → "16GB'da çalışır" vaadi korunur.
+
+2. **İki aşamalı retrieval** (eksen = *granülerlik*, derinlik değil):
+   - **Ağaç = kaba navigasyon** → doğru bölümü/alt-ağacı seçer (PageIndex gücü).
+   - **Vektör = seçilen yaprağın *içinde* ince arama** → tam pasajı bulur (RAG gücü).
+   - Vektör artık "ağaç başarısız olursa fallback" değil, **seçilen kapsam içindeki ikinci aşama**.
+
+3. **Derinlik sınırı (5-6)** bir runtime switch değil, **ağaç inşa parametresi**: daha derin yapı yaprak içeriğine "katlanır" ki her yaprak makul boyutta kalsın.
+
+4. **LLM düğüm özetleri** — indekslemede her düğüme kısa LLM özeti (mevcut "ilk 3 cümle" naif yöntemin yerine). Ağaç navigasyon kalitesi buna bağlıdır.
+
+5. **Recursive descent navigasyon** — tüm düz ağacı tek prompt'a basmak yerine (büyük belgede 7B'yi boğar) seviye seviye in. Her LLM çağrısı küçük kalır → 16GB+7B kısıtına doğrudan hizmet eder.
+
+6. **Alıntı tabanlı grounding** — Self-NLI yerine cevapta zorunlu sayfa/bölüm alıntısı (PageIndex "traceable" felsefesi; daha ucuz ve güçlü).
+
+### 6.3. Çıkarılacaklar (basitleştir + 16GB'a yer aç)
+
+- **Self-NLI** (aynı modelle kendini denetleme): LLM çağrısını ikiye katlıyor, zayıf → alıntı grounding ile değiştir.
+- **Anahtar kelime tabanlı execution policy** (kırılgan Türkçe liste): kaldır, navigasyon doğal karar versin.
+- **Regex DAG linkleri**: gürültülü, düşük değer → şimdilik çıkar.
+- **Her sorguda iki hattı birden koşmak**: israf → ağaç-önce, vektör-yaprak-içinde.
+
+### 6.4. Hedef Boru Hattı
+
+```
+İNDEKSLEME (offline, tek seferlik):
+  Stage 0  Parse  → katmanlı (PyMuPDF / Docling / Chandra) → yapısal Markdown
+  Stage 1  Ağaç   → hiyerarşi çıkar, derinlik 5-6'da katla, her düğüme LLM özeti
+  Stage 2  Embed  → SADECE yaprak pasajlarını vektörle (kapsam dar → küçük DB, hızlı)
+
+SORGU (online):
+  1. Recursive descent ile ağaçta gez → ilgili yaprak/alt-ağaç(lar)ı seç
+  2. O kapsam İÇİNDE dense + lexical retrieval → tam pasaj
+  3. Token bütçesiyle sentez + zorunlu alıntı (sayfa/bölüm)
+
+MODEL YAŞAM DÖNGÜSÜ (16GB):
+  parse → unload → embed → query. Asla aynı anda iki ağır model yok.
+  qwen2.5:7b Q4 (~4.7GB) + nomic-embed (~0.3GB) → 16GB'a rahat sığar.
+  Chandra (opsiyonel) yalnız parse fazında, sonra unload.
+```
+
+### 6.5. Önce Yapılacak Retrieval Düzeltmeleri (mevcut koda)
+
+Mimariye geçmeden mevcut retrieval'ı sağlamlaştıran hızlı kazanımlar (detay: hafıza `project-roadmap`):
+1. ChromaDB `hnsw:space="cosine"` + doğru `similarity` formülü.
+2. Embedding fallback'i fail-fast yap + timeout artır.
+3. nomic task prefix'leri (`search_query:` / `search_document:`).
+
+### 6.6. Açık Sorular / İleride Karar Verilecek
+
+- Docling mi Marker mı "iyi kat" olsun? (kalite/ağırlık kıyası gerekli)
+- Çoklu belge üzerinde cross-document sorgu kapsama dahil mi?
+- Ağaç özetlerini hangi modelle üretelim (qwen2.5:7b yeterli mi, yoksa daha küçük hızlı bir model mi)?
+- Recursive descent'te "yanlış dala saparsa" geri dönüş (backtrack) stratejisi.
