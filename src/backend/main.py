@@ -338,8 +338,13 @@ def _valid_ids(raw_list, present_ids):
 
 
 def run_recursive_descent(document_id, query, children_map, node_map, heatmap, model_name, trace):
-    """Ağaçta seviye seviye inerek soruyla ilgili hedef düğümleri toplar."""
+    """
+    Ağaçta seviye seviye inerek soruyla ilgili hedef düğümleri toplar.
+    Döner: (targets, confidence, descended). descended = inilen iç (bölüm başlığı)
+    düğümleri; listeleme/genel-bakış sorularında bunların özetleri de kullanılır.
+    """
     targets = set()
+    descended = set()
     visited = set()
     frontier = list(children_map.get(None, []))
     calls = 0
@@ -365,6 +370,7 @@ def run_recursive_descent(document_id, query, children_map, node_map, heatmap, m
             kids = children_map.get(nid, [])
             if kids:
                 next_frontier.extend(kids)
+                descended.add(nid)  # inilen bölüm başlığı (özeti listelemede kullanılır)
             else:
                 targets.add(nid)  # yaprak: daha derine inilemez, hedef say
 
@@ -376,7 +382,7 @@ def run_recursive_descent(document_id, query, children_map, node_map, heatmap, m
         visited.update(present_ids)
         frontier = [n for n in next_frontier if n["id"] not in visited]
 
-    return targets, confidence
+    return targets, confidence, descended
 
 
 def _subtree_ids(root_ids, children_map):
@@ -429,7 +435,7 @@ def query_aegis(payload: QueryRequest):
     # ==========================================
     # 2. Recursive Descent (seviye seviye iniş)
     # ==========================================
-    targets, confidence = run_recursive_descent(
+    targets, confidence, descended = run_recursive_descent(
         document_id, query, children_map, node_map, heatmap_scores, model_name, trace
     )
     fallback_triggered = (not targets) or confidence == "LOW"
@@ -446,19 +452,27 @@ def query_aegis(payload: QueryRequest):
     budget = config.TOKEN_BUDGET
 
     if not fallback_triggered:
-        # 3a. Hedeflerin özetleri (listeleme/genel-bakış soruları için kritik)
-        for tid in sorted(targets)[: config.MAX_LEAVES * 2]:
+        # 3a. Özetler: inilen bölüm başlıkları + seçilen hedefler. En SIĞ düğümler
+        # (bölüm başlıkları) önce gelsin ki "listele/genel-bakış" sorularında tüm
+        # bölümler görünsün (derin alt-düğümler özet bloğunu doldurup bölümleri düşürmesin).
+        # Özetlere bütçenin yarısı ayrılır; kalanı pasajlara.
+        summary_budget = int(budget * 0.5)
+        summary_ids = sorted(
+            set(targets) | set(descended),
+            key=lambda i: (node_map[i]["level"] if i in node_map else 99, i),
+        )
+        for tid in summary_ids:
             node = node_map.get(tid)
             summ = (node.get("summary") or "").strip() if node else ""
             if summ:
                 block = f"[ÖZET — {node['path']}]: {summ}"
                 t = calculate_approx_tokens(block)
-                if current_token_count + t <= budget:
+                if current_token_count + t <= summary_budget:
                     context_blocks.append(block)
                     current_token_count += t
 
-        # 3b. Yaprak-içi scoped pasaj araması (seçilen alt-ağaçlar İÇİNDE)
-        scope = list(_subtree_ids(targets, children_map))
+        # 3b. Yaprak-içi scoped pasaj araması (seçilen + inilen alt-ağaçlar İÇİNDE)
+        scope = list(_subtree_ids(set(targets) | set(descended), children_map))
         scoped = db_manager.query_chroma(document_id, query, top_k=config.RERANK_TOP_K * 2, node_ids=scope)
         scoped = lexical_semantic_rerank(query, scoped, top_k=config.RERANK_TOP_K)
         for res in scoped:

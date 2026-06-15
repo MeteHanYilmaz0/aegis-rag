@@ -60,20 +60,22 @@ class TestRecursiveDescent(unittest.TestCase):
             {"select": [4], "descend": [], "confidence": "HIGH"},
         ]
         self._mock_sequence(seq)
-        targets, conf = main.run_recursive_descent(1, "q", self.children, self.node_map, {}, "x", [])
+        targets, conf, descended = main.run_recursive_descent(1, "q", self.children, self.node_map, {}, "x", [])
         self.assertEqual(sorted(targets), [2, 4])
         self.assertEqual(conf, "HIGH")
+        # İnilen bölüm başlıkları (çocuğu olan) takip edilmeli
+        self.assertEqual(sorted(descended), [1, 3])
 
     def test_low_confidence_breaks(self):
         self._mock_sequence([{"select": [], "descend": [], "confidence": "LOW"}])
-        targets, conf = main.run_recursive_descent(1, "q", self.children, self.node_map, {}, "x", [])
+        targets, conf, _descended = main.run_recursive_descent(1, "q", self.children, self.node_map, {}, "x", [])
         self.assertEqual(targets, set())
         self.assertEqual(conf, "LOW")
 
     def test_descend_leaf_becomes_target(self):
         # 5 yaprak; descend'e 5 verilse bile hedef olur
         self._mock_sequence([{"select": [], "descend": [5], "confidence": "HIGH"}])
-        targets, conf = main.run_recursive_descent(1, "q", self.children, self.node_map, {}, "x", [])
+        targets, conf, _descended = main.run_recursive_descent(1, "q", self.children, self.node_map, {}, "x", [])
         self.assertEqual(sorted(targets), [5])
 
 
