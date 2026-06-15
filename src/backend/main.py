@@ -278,181 +278,226 @@ def get_upload_progress(job_id: str):
         raise HTTPException(status_code=404, detail="İşlem bulunamadı.")
     return UPLOAD_STATUS[job_id]
 
+# ==========================================================================
+# Faz 3: Recursive Descent Navigasyonu + Yaprak-içi Scoped Retrieval
+# ==========================================================================
+
+def _descent_prompt(query: str, frontier: List[Dict[str, Any]], heatmap: Dict[Any, float]) -> str:
+    lines = []
+    for n in frontier:
+        nid = n["id"]
+        score = heatmap.get(nid, heatmap.get(str(nid)))
+        heat = f" [uyuşma %{score * 100:.0f}]" if score else ""
+        kind = "alt-başlıkları var" if not n.get("is_leaf") else "yaprak"
+        summary = (n.get("summary") or "").strip().replace("\n", " ")[:200]
+        lines.append(f"[ID:{nid}] {n['heading']} ({kind}){heat}\n    özet: {summary}")
+    tree_text = "\n".join(lines)
+    return f"""Sana bir belgenin bir seviyesindeki başlıklar (özetleriyle) ve bir kullanıcı sorusu verilecek.
+Görevin: soruyu yanıtlamak için hangi başlıklara İNMEK (descend; alt-başlıklarına bakmak) ve
+hangilerini doğrudan OKUMAK (select) gerektiğine karar vermektir.
+
+BAŞLIKLAR:
+{tree_text}
+
+KULLANICI SORUSU:
+"{query}"
+
+YÖNERGELER:
+1. Cevabın doğrudan içinde olabileceği başlıkları "select"e ekle.
+2. İlgili ama daha derine inilmesi gereken (alt-başlığı olan) başlıkları "descend"e ekle.
+3. Karşılaştırma/listeleme sorularında ilgili TÜM başlıkları seç.
+4. Hiçbiri ilgili değilse iki listeyi de boş bırak ve confidence "LOW" ver.
+5. SADECE şu JSON'u döndür, başka hiçbir metin ekleme:
+{{"select": [id, ...], "descend": [id, ...], "confidence": "HIGH|MEDIUM|LOW"}}"""
+
+
+def _ask_descent(model_name: str, query: str, frontier: List[Dict[str, Any]], heatmap: Dict[Any, float]):
+    try:
+        raw = ollama_generate(model_name, _descent_prompt(query, frontier, heatmap), temperature=0.0)
+        data = json.loads(clean_json_response(raw))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _cap_frontier(frontier: List[Dict[str, Any]], heatmap: Dict[Any, float], cap: int = 25):
+    """Çok geniş seviyelerde (örn. yüzlerce L1) frontier'ı ısı haritasına göre buda."""
+    if len(frontier) <= cap:
+        return frontier
+    def sc(n):
+        return heatmap.get(n["id"], heatmap.get(str(n["id"]), 0)) or 0
+    return sorted(frontier, key=sc, reverse=True)[:cap]
+
+
+def _valid_ids(raw_list, present_ids):
+    out = []
+    for i in raw_list or []:
+        if isinstance(i, (int, str)) and str(i).isdigit() and int(i) in present_ids:
+            out.append(int(i))
+    return out
+
+
+def run_recursive_descent(document_id, query, children_map, node_map, heatmap, model_name, trace):
+    """Ağaçta seviye seviye inerek soruyla ilgili hedef düğümleri toplar."""
+    targets = set()
+    visited = set()
+    frontier = list(children_map.get(None, []))
+    calls = 0
+    confidence = "MEDIUM"
+
+    while frontier and calls < config.MAX_DESCENT_CALLS:
+        present = _cap_frontier(frontier, heatmap)
+        data = _ask_descent(model_name, query, present, heatmap)
+        calls += 1
+        if data is None:
+            confidence = "LOW"
+            break
+
+        confidence = data.get("confidence", "MEDIUM")
+        present_ids = {n["id"] for n in present}
+        select_ids = _valid_ids(data.get("select"), present_ids)
+        descend_ids = _valid_ids(data.get("descend"), present_ids)
+
+        targets.update(select_ids)
+
+        next_frontier = []
+        for nid in descend_ids:
+            kids = children_map.get(nid, [])
+            if kids:
+                next_frontier.extend(kids)
+            else:
+                targets.add(nid)  # yaprak: daha derine inilemez, hedef say
+
+        if select_ids or descend_ids:
+            trace.append(f"🧭 **Descent (tur {calls}):** okunacak={select_ids or '-'} · inilen={descend_ids or '-'}")
+
+        if not descend_ids:
+            break
+        visited.update(present_ids)
+        frontier = [n for n in next_frontier if n["id"] not in visited]
+
+    return targets, confidence
+
+
+def _subtree_ids(root_ids, children_map):
+    """Verilen düğümler + tüm alt-ağaç (descendant) node_id kümesi (scoped arama kapsamı)."""
+    out = set()
+    stack = list(root_ids)
+    while stack:
+        nid = stack.pop()
+        if nid in out:
+            continue
+        out.add(nid)
+        for ch in children_map.get(nid, []):
+            stack.append(ch["id"])
+    return out
+
+
 @app.post("/api/query")
 def query_aegis(payload: QueryRequest):
-    """
-    Research-Grade Çift Hatlı Kesişim ve Deterministik Orkestrasyon Akışı.
-    """
+    """Hiyerarşik recursive descent + yaprak-içi scoped retrieval + alıntılı sentez."""
     document_id = payload.document_id
     query = payload.query
     model_name = payload.model_name
-    
+
     if not check_ollama_status():
         raise HTTPException(status_code=503, detail="Yerel Ollama servisine bağlanılamadı.")
 
     nodes = db_manager.get_document_nodes(document_id)
     if not nodes:
         raise HTTPException(status_code=404, detail="Dokümana ait TOC ağacı bulunamadı.")
-        
+
     trace = []
-    
-    # ==========================================
-    # 1. KATMAN: Explicit Execution Policy Layer
-    # ==========================================
-    execution_policy = "Hierarchical Single-Node"
-    query_lower = query.lower()
-    
-    # Karşılaştırma veya çoklu referans kalıplarını tara
-    multi_indicators = ["kıyasla", "karşılaştır", "arasındaki fark", "farkları", "ve ek", "ikisi", "ilişkisi"]
-    is_multi_subtree = any(ind in query_lower for ind in multi_indicators)
-    
-    if is_multi_subtree:
-        execution_policy = "Multi-Subtree Synthesis"
-    elif len(query.split()) < 3: # Çok kısa anahtar kelimeler doğrudan vektöre aktarılır
-        execution_policy = "Hybrid Reranked Fallback"
-        
-    trace.append(f"🛡️ **Execution Policy Katmanı:** Deterministik politika belirlendi -> `[{execution_policy}]` Modu.")
+    node_map = {n["id"]: n for n in nodes}
+    children_map: Dict[Any, List[Dict[str, Any]]] = {}
+    for n in nodes:
+        children_map.setdefault(n["parent_id"], []).append(n)
 
     # ==========================================
-    # 2. KATMAN: Çift Hatlı Arama & Kesişim (Heatmap)
+    # 1. Heatmap (global çift-hat: ChromaDB + rerank) — UI + descent ipucu
     # ==========================================
-    # ChromaDB semantik arama (ham adaylar)
     semantic_raw = db_manager.query_chroma(document_id, query, top_k=config.SEMANTIC_TOP_K)
-
-    # Lexical-Semantic Reranking Katmanı
     reranked_hits = lexical_semantic_rerank(query, semantic_raw, top_k=config.RERANK_TOP_K)
-    
-    # Isı haritasını (Heatmap) hesapla
     heatmap_scores = {}
     for hit in reranked_hits:
         n_id = hit["metadata"].get("node_id")
         score = hit["hybrid_score"]
         if n_id not in heatmap_scores or score > heatmap_scores[n_id]:
             heatmap_scores[n_id] = score
-            
-    trace.append(f"🔥 **Semantik Isı Haritası (Heatmap) Hesaplandı:** {len(heatmap_scores)} düğüm pozitif eşleşme aldı.")
-
-    # Ağaç listesini işaretle
-    flat_tree_lines = []
-    for node in nodes:
-        n_id = node["id"]
-        indent = "-" * (node["level"] - 1)
-        prefix = f"{indent} " if indent else ""
-        heat_text = f" [Anlamsal Uyuşma: %{heatmap_scores[n_id]*100:.1f}]" if n_id in heatmap_scores else ""
-        flat_tree_lines.append(f"[ID: {n_id}] {prefix}{node['heading']}{heat_text}")
-        
-    flat_tree_text = "\n".join(flat_tree_lines)
+    trace.append(f"🔥 **Semantik Isı Haritası:** {len(heatmap_scores)} düğüm pozitif eşleşme aldı.")
 
     # ==========================================
-    # 3. KATMAN: Yönlendirme ve Uncertainty-Aware Kontrolü
+    # 2. Recursive Descent (seviye seviye iniş)
     # ==========================================
-    selected_node_ids = []
-    fallback_triggered = False
-    
-    if execution_policy != "Hybrid Reranked Fallback":
-        # LLM'e ısı haritalı ağacı sunup yönlendirme yapmasını iste
-        routing_prompt = f"""
-Sana bir belgenin ısı haritalı başlık ağacı (TOC) ve bir kullanıcı sorusu verilecek. Görevin, soruyu yanıtlamak için okunması gereken en uygun başlık düğümlerinin (Node ID) listesini çıkarmaktır.
-
-BELGE BAŞLIK AĞACI:
-{flat_tree_text}
-
-KULLANICI SORUSU:
-"{query}"
-
-YÖNERGELER:
-1. Soru doğrudan bir bölümle ilgiliyse, o bölümün ID'sini döndür.
-2. Soru birden fazla bölümü karşılaştırıyorsa, o bölümlerin ID listesini döndür.
-3. Eğer anlamsal uyuşmalar (skorlar) çok düşükse veya hiçbir başlık soruyla doğrudan ilgili değilse `selected_node_ids` listesini boş bırak.
-4. Yanıtı MUTLAK suretle aşağıdaki JSON formatında ver. Başka hiçbir metin ekleme.
-
-JSON FORMATI:
-{{
-  "selected_node_ids": [id1, id2, ...],
-  "confidence": "HIGH veya MEDIUM veya LOW",
-  "reason": "kısa gerekçe"
-}}
-"""
-        try:
-            raw_response = ollama_generate(model_name, routing_prompt, temperature=0.0)
-            raw_json = clean_json_response(raw_response)
-            route_data = json.loads(raw_json)
-
-            selected_node_ids = route_data.get("selected_node_ids", [])
-            confidence = route_data.get("confidence", "MEDIUM")
-            reason = route_data.get("reason", "")
-
-            # Uncertainty-Aware Routing: Güven skoru LOW ise doğrudan fallback
-            if confidence == "LOW" or not selected_node_ids:
-                fallback_triggered = True
-                trace.append("⚠️ **Uncertainty-Aware Tetiklendi:** Güven düzeyi Düşük (LOW). Yönlendirme devre dışı bırakılarak doğrudan Fallback moduna geçiliyor.")
-            else:
-                trace.append(f"🎯 **Yönlendirme Başarılı:** Seçilen Düğümler: {selected_node_ids} (Gerekçe: {reason})")
-        except Exception as e:
-            fallback_triggered = True
-            trace.append(f"⚠️ **Yönlendirme Hatası:** {str(e)}. Fallback aktif.")
+    targets, confidence = run_recursive_descent(
+        document_id, query, children_map, node_map, heatmap_scores, model_name, trace
+    )
+    fallback_triggered = (not targets) or confidence == "LOW"
+    if fallback_triggered:
+        trace.append("⚠️ **Descent sonuçsuz / düşük güven → Semantik Fallback'e geçiliyor.**")
     else:
-        fallback_triggered = True
+        trace.append(f"🎯 **Descent tamamlandı:** hedef düğümler {sorted(targets)} (güven: {confidence}).")
 
     # ==========================================
-    # 4. KATMAN: Context Economy & Token Budgeting (Bağlam Bütçeleme)
+    # 3. Bağlam: hedef özetleri + yaprak-içi scoped pasajlar (Context Economy)
     # ==========================================
     context_blocks = []
-    total_token_budget = config.TOKEN_BUDGET # Maksimum güvenli sınır
     current_token_count = 0
-    
-    if not fallback_triggered and selected_node_ids:
-        # Seçilen düğümleri ve bunlara bağlı DAG komşularını çek
-        for node_id in selected_node_ids[:3]: # Çoklu sentezde maksimum 3 düğüm sınırı (Orchestration guard)
-            node_details = db_manager.get_node_by_id(document_id, int(node_id))
-            if not node_details:
-                continue
-                
-            node_content = node_details["content"]
-            node_path = node_details["path"]
-            
-            # Ebeveyn restorasyonu ve hiyerarşi etiketi
-            header_block = f"--- BÖLÜM: {node_path} ---\n"
-            block_tokens = calculate_approx_tokens(header_block + node_content)
-            
-            # Bütçe kontrolü: Eğer ana düğüm bütçeyi aşıyorsa kesirli sıkıştırma yap
-            if current_token_count + block_tokens > total_token_budget:
-                remaining_tokens = total_token_budget - current_token_count
-                if remaining_tokens > 100:
-                    truncated_content = node_content[:int(remaining_tokens * 4)] + "\n...[Bütçe Sınırı Nedeniyle Kesildi]..."
-                    context_blocks.append(header_block + truncated_content)
-                    current_token_count += remaining_tokens
-                break
-            else:
-                context_blocks.append(header_block + node_content)
-                current_token_count += block_tokens
+    budget = config.TOKEN_BUDGET
 
-    # Fallback RAG
-    if fallback_triggered or not context_blocks:
-        trace.append("🔍 **ChromaDB Vektör Havuzundan Okuma Yapılıyor...**")
-        for idx, res in enumerate(reranked_hits):
-            sim_score = res["hybrid_score"]
-            path_str = res["metadata"].get("path", "Genel")
-            
-            block = f"--- Semantik Parça #{idx+1} [Uyum: {sim_score:.2%}] (Bölüm: {path_str}) ---\n{res['content']}\n"
-            block_tokens = calculate_approx_tokens(block)
-            
-            if current_token_count + block_tokens <= total_token_budget:
+    if not fallback_triggered:
+        # 3a. Hedeflerin özetleri (listeleme/genel-bakış soruları için kritik)
+        for tid in sorted(targets)[: config.MAX_LEAVES * 2]:
+            node = node_map.get(tid)
+            summ = (node.get("summary") or "").strip() if node else ""
+            if summ:
+                block = f"[ÖZET — {node['path']}]: {summ}"
+                t = calculate_approx_tokens(block)
+                if current_token_count + t <= budget:
+                    context_blocks.append(block)
+                    current_token_count += t
+
+        # 3b. Yaprak-içi scoped pasaj araması (seçilen alt-ağaçlar İÇİNDE)
+        scope = list(_subtree_ids(targets, children_map))
+        scoped = db_manager.query_chroma(document_id, query, top_k=config.RERANK_TOP_K * 2, node_ids=scope)
+        scoped = lexical_semantic_rerank(query, scoped, top_k=config.RERANK_TOP_K)
+        for res in scoped:
+            meta = res["metadata"]
+            page = meta.get("start_page")
+            page_str = f", s.{page}" if page and page != -1 else ""
+            block = f"--- Pasaj ({meta.get('path', 'Genel')}{page_str}) ---\n{res['content']}"
+            t = calculate_approx_tokens(block)
+            if current_token_count + t <= budget:
                 context_blocks.append(block)
-                current_token_count += block_tokens
+                current_token_count += t
+            else:
+                break
+        trace.append(f"🔎 **Yaprak-içi arama:** {len(scope)} düğümlük kapsamda {len(scoped)} pasaj değerlendirildi.")
+
+    # 3c. Fallback: tüm belge üzerinde semantik (descent boşsa veya bağlam boş kaldıysa)
+    if fallback_triggered or not context_blocks:
+        fallback_triggered = True
+        trace.append("🔍 **ChromaDB Vektör Havuzundan (global) okuma yapılıyor...**")
+        for idx, res in enumerate(reranked_hits):
+            meta = res["metadata"]
+            page = meta.get("start_page")
+            page_str = f", s.{page}" if page and page != -1 else ""
+            block = f"--- Semantik Parça #{idx + 1} ({meta.get('path', 'Genel')}{page_str}) ---\n{res['content']}"
+            t = calculate_approx_tokens(block)
+            if current_token_count + t <= budget:
+                context_blocks.append(block)
+                current_token_count += t
             else:
                 break
 
-    trace.append(f"📊 **Context Economy:** Bağlam Penceresi Kullanımı: **{current_token_count} / {total_token_budget}** Yaklaşık Token.")
+    trace.append(f"📊 **Context Economy:** {current_token_count} / {budget} yaklaşık token.")
 
     # ==========================================
-    # 5. KATMAN: Sentez ve Local NLI Tutarlılık Süzgeci
+    # 4. Sentez (alıntılı, grounding; Self-NLI kaldırıldı)
     # ==========================================
     final_context = "\n\n".join(context_blocks)
-    
-    qa_prompt = f"""
-Sana bir belgeden alınmış doğrulanmış bağlam (context) ve bir soru verilecek.
-Görevin, bağlamdaki bilgilere sadık kalarak soruyu Türkçe olarak kapsamlı şekilde yanıtlamaktır.
+    qa_prompt = f"""Sana bir belgeden seçilmiş bağlam (özetler + pasajlar) ve bir soru verilecek.
+Görevin, YALNIZCA bağlamdaki bilgilere dayanarak soruyu Türkçe ve doğrudan yanıtlamak.
 
 BAĞLAM:
 {final_context}
@@ -461,56 +506,25 @@ SORU:
 "{query}"
 
 KURALLAR:
-1. Yalnızca verilen bağlamdaki gerçekleri kullan. 
-2. Bilgilerin yetersiz olduğu yerleri belirt ama uydurma yapma.
-3. Cevap içinde atıfta bulunduğun bölümleri (örn: Bölüm 2.1) parantez içinde belirt.
-4. Cevabı doğrudan, net ve üçüncü şahıs ağzından yaz. Kendi düşünce sürecini, "bu metne göre", "cevap şöyle olabilir", "yönergelere göre" gibi meta-ifadeleri yanıta kesinlikle dahil etme. Doğrudan cevabı döndür.
+1. Sadece bağlamdaki gerçekleri kullan; bağlamda olmayan bir şeyi UYDURMA.
+2. Bilgi bağlamda yoksa açıkça "Belgede bu bilgi bulunmuyor." de.
+3. Atıf yaptığın yeri parantez içinde belirt (bölüm yolu ve varsa sayfa).
+4. Doğrudan cevabı yaz; "bağlama göre", "yönergelere göre" gibi meta-ifadeleri kullanma.
 """
-
     answer = "Cevap oluşturulamadı."
     try:
-        candidate_answer = ollama_generate(model_name, qa_prompt).strip()
-
-        if candidate_answer:
-            # Local NLI-style Consistency Heuristic (Self-Reflection Check)
-            nli_prompt = f"""
-Sana bir bağlam ve bu bağlama göre üretilmiş bir yapay zeka cevabı verilecek.
-Görevin, cevabın bağlamdaki bilgilerle çelişip çelişmediğini (çelişki, halüsinasyon veya uydurma bilgi içerip içermediğini) kontrol etmektir.
-
-BAĞLAM:
-{final_context[:2500]}
-
-YAPAY ZEKA CEVABI:
-{candidate_answer[:2000]}
-
-KURALLAR:
-1. Eğer cevap bağlamla tamamen uyumluysa ve uydurma bilgi içermiyorsa kelimesi kelimesine sadece "CONSISTENT" yaz.
-2. Eğer cevapta bağlam dışı/çelişkili uydurma bir iddia varsa sadece "CONTRADICTION" yaz.
-"""
-            try:
-                nli_status = ollama_generate(model_name, nli_prompt, temperature=0.0).strip()
-            except Exception:
-                nli_status = "CONSISTENT"
-
-            if "CONTRADICTION" in nli_status:
-                trace.append("⚠️ **Local NLI Tutarlılık Süzgeci:** Çelişki/Uydurma şüphesi tespit edildi. Güvenli filtreleme uygulanıyor.")
-                # Çelişkili cevaba bir uyarı notu ekleyelim
-                answer = candidate_answer + "\n\n*(Not: Aegis yerel NLI süzgeci bu yanıtın bazı kısımlarında bağlam tutarsızlığı tespit etmiştir, lütfen kaynakları doğrulayınız.)*"
-            else:
-                trace.append("🟢 **Local NLI Tutarlılık Süzgeci:** Yanıt bağlamla tutarlı bulundu (CONSISTENT).")
-                answer = candidate_answer
-        else:
-            answer = "Model boş yanıt döndürdü."
+        candidate = ollama_generate(model_name, qa_prompt).strip()
+        answer = candidate if candidate else "Model boş yanıt döndürdü."
     except Exception as e:
         answer = f"Sorgu işlenirken bir hata oluştu: {str(e)}"
         trace.append(f"❌ **Hata:** {str(e)}")
 
     return {
         "answer": answer,
-        "selected_node_ids": selected_node_ids,
-        "execution_policy": execution_policy,
+        "selected_node_ids": sorted(targets),
+        "execution_policy": "Semantik Fallback" if fallback_triggered else "Recursive Descent",
         "fallback_triggered": fallback_triggered,
         "context_tokens": current_token_count,
         "heatmap_scores": heatmap_scores,
-        "trace": trace
+        "trace": trace,
     }

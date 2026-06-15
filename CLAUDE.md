@@ -51,15 +51,14 @@ Tek bir `DBManager` hem SQLite'ı hem ChromaDB'yi yönetir. **Her belge ikisine 
 ### Parse katmanı (`src/parser/toc_extractor.py`)
 Üst giriş noktası `extract_tree(pdf_path)`: gömülü TOC/yer imini **yalnız güvenilirse** kullanır (`_bookmarks_usable`: ≥3 giriş VE en büyük bölüm belgenin ≤%25'i — slayt destelerindeki seyrek/yanlış-yerleşmiş yer imleri içerik kaymasına yol açtığından elenir), aksi halde sezgisel yola düşer (`convert_pdf_to_markdown` → `extract_toc_tree`). Başlık tespiti **satır seviyesinde** ve **slayt-duyarlıdır**: mutlak font eşiği (kitap) + **sayfa-içi göreceli oran** (`size/page_body ≥ 1.18`, slaytlarda gövde font globalde büyük olduğu için şart) + kalın + numaralandırma; kısa ve cümle noktalamasıyla bitmeyen satırlar. Tüm yollar `finalize_tree` ile sonlanır: **derinlik katlama** (`MAX_TREE_DEPTH`) + **`is_leaf`**. `.md/.txt` için `extract_toc_tree` + `finalize_tree` ayrı çağrılır.
 
-### Sorgu orkestrasyonu — 5 katman (`src/backend/main.py`, `/api/query`)
+### Sorgu orkestrasyonu — recursive descent (`src/backend/main.py`, `/api/query`, Faz 3)
 Bu, sistemin kalbidir ve sırayla çalışır:
-1. **Execution Policy** (deterministik, LLM'siz): sorgudaki anahtar kelimelerden mod seçer — `Multi-Subtree Synthesis` (kıyaslama kelimeleri), `Hybrid Reranked Fallback` (<3 kelime), yoksa `Hierarchical Single-Node`.
-2. **Çift hat + heatmap**: ChromaDB top-10 → `lexical_semantic_rerank` (0.6·cosine + 0.4·kelime çakışması) → düğüm başına `hybrid_score` = heatmap.
-3. **Routing (LLM)**: ısı haritalı tüm ağaç + soru LLM'e verilir, okunacak `node_id` listesi + `confidence` döner. `confidence == LOW` veya boş liste → **fallback** tetiklenir.
-4. **Context Economy**: 4000 token katı bütçe. Seçilen düğümler (max 3) eklenir; bütçe aşılırsa kırpılır. Fallback durumunda doğrudan reranked ChromaDB parçaları kullanılır. (Not: Faz 3'te bu katman recursive descent + yaprak-içi scoped aramayla değişecek.)
-5. **Sentez + Local NLI**: LLM cevabı üretir, sonra aynı model cevabı bağlama karşı `CONSISTENT`/`CONTRADICTION` diye denetler; çelişkide cevaba uyarı notu eklenir.
+1. **Heatmap (global çift-hat)**: ChromaDB top-k → `lexical_semantic_rerank` (0.6·cosine + 0.4·kelime çakışması) → düğüm başına `hybrid_score`. UI ısı haritası + descent ipucu olarak kullanılır.
+2. **Recursive descent** (`run_recursive_descent`): kök çocuklarından başlayıp seviye seviye iner. Her turda frontier düğümleri (başlık + **özet** + ısı) LLM'e sunulur; LLM JSON döndürür: `select` (doğrudan oku), `descend` (alt-başlığına in), `confidence`. İç düğüm `descend`, yaprak `select`/hedef olur. `MAX_DESCENT_CALLS` ve `_cap_frontier` (geniş seviyelerde ısıya göre budama) ile sınırlı. Hedef yoksa veya `confidence==LOW` → fallback.
+3. **Context Economy**: `TOKEN_BUDGET` katı bütçe. (a) Hedef düğümlerin **özetleri** (listeleme/genel-bakış için), (b) **yaprak-içi scoped arama**: `query_chroma(node_ids=alt-ağaç)` ile seçilen kapsam İÇİNDE pasajlar. Fallback'te tüm belge üzerinde global reranked pasajlar.
+4. **Sentez**: LLM yalnız bağlamla, **alıntılı** (bölüm yolu/sayfa) ve "yoksa belirt" kuralıyla cevap üretir. (Self-NLI **kaldırıldı** — testlerde güvenilmez çıktı; yerini grounding/alıntı aldı.)
 
-Yanıt; `answer` + `trace` (UI'da "Tree Trace" olarak gösterilen karar günlüğü) + `heatmap_scores` + `selected_node_ids` döner.
+Yanıt; `answer` + `trace` (UI'da "Tree Trace") + `heatmap_scores` + `selected_node_ids` (hedef düğümler) + `execution_policy` (`Recursive Descent`/`Semantik Fallback`) + `fallback_triggered` döner. Descent yardımcıları için testler: `tests/test_descent.py`.
 
 ### UI (`src/ui/app.py`)
 Tek dosyalık Streamlit. Sol sütun: ısı haritalı/seçili-düğüm vurgulu TOC ağacı. Sağ sütun: sohbet + dashboard rozetleri (policy/token/fallback) + Tree Trace expander. Yükleme, backend'in `BackgroundTasks` job'ını başlatıp `progress/{job_id}`'i 0.5sn aralıkla **bloklayarak poll eder** (timeout yok). Backend URL sabit: `http://127.0.0.1:8002`.
