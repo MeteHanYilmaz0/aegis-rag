@@ -16,8 +16,13 @@ BACKEND_URL = f"http://{BACKEND_HOST}:{BACKEND_PORT}"
 
 # --- Modeller ---
 LLM_MODEL = os.getenv("AEGIS_LLM_MODEL", "qwen3:8b")            # navigasyon + sentez
-SUMMARY_MODEL = os.getenv("AEGIS_SUMMARY_MODEL", "qwen3:4b")    # offline özet (Faz 2)
+SUMMARY_MODEL = os.getenv("AEGIS_SUMMARY_MODEL", "qwen3:8b")    # düğüm özetleri (offline)
 EMBED_MODEL = os.getenv("AEGIS_EMBED_MODEL", "nomic-embed-text")  # alternatif: bge-m3
+
+# Düğüm özetleri: True ise indekslemede her düğüm için LLM özeti üretilir (navigasyon
+# kalitesini artırır ama indekslemeyi yavaşlatır). False ise hızlı çıkarımsal (ilk N cümle)
+# özet kullanılır. LLM çağrısı başarısız olursa otomatik çıkarımsal özete düşülür.
+USE_LLM_SUMMARIES = os.getenv("AEGIS_USE_LLM_SUMMARIES", "false").lower() == "true"
 
 # Thinking modelleri (qwen3 vb.) düşünce çıktısını JSON/sentez yanıtına sızdırmasın.
 LLM_THINKING = False

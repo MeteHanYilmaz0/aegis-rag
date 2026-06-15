@@ -187,10 +187,13 @@ def process_uploaded_document(job_id: str, filename: str, temp_path: str, temp_d
             }
 
         if file_ext == ".pdf":
-            markdown_content = TOCExtractor.convert_pdf_to_markdown(temp_path, progress_callback=parser_callback)
+            # PDF: gömülü TOC önceliği + sezgisel yol + finalize (depth fold + is_leaf)
+            toc_nodes = TOCExtractor.extract_tree(temp_path, progress_callback=parser_callback)
         else:
             with open(temp_path, "r", encoding="utf-8", errors="ignore") as f:
                 markdown_content = f.read()
+            raw_nodes = TOCExtractor.extract_toc_tree(markdown_content)
+            toc_nodes = TOCExtractor.finalize_tree(raw_nodes, config.MAX_TREE_DEPTH)
 
         UPLOAD_STATUS[job_id] = {
             "status": "processing",
@@ -198,10 +201,8 @@ def process_uploaded_document(job_id: str, filename: str, temp_path: str, temp_d
             "current": 100,
             "total": 100,
             "percentage": 100.0,
-            "message": "TOC hiyerarşik başlık ağacı çıkarılıyor..."
+            "message": "TOC hiyerarşik başlık ağacı çıkarıldı, indeksleniyor..."
         }
-        
-        toc_nodes = TOCExtractor.extract_toc_tree(markdown_content)
         
         # Progress callback for db manager (ChromaDB embedding)
         def db_callback(current, total):
@@ -425,21 +426,6 @@ JSON FORMATI:
             else:
                 context_blocks.append(header_block + node_content)
                 current_token_count += block_tokens
-                
-            # DAG Çapraz Bağlantılarını (Komşuları) ekle (Strict Limit: Max 1 depth, Max 1 neighbor)
-            dag_links = db_manager.get_dag_links(document_id, int(node_id))
-            if dag_links:
-                for link in dag_links[:1]: # Sadece en alakalı ilk referansı ekle
-                    link_details = db_manager.get_node_by_id(document_id, link["target_node_id"])
-                    if link_details and link_details["summary"]:
-                        # Sadece özet eklenir (Context Economy)
-                        aux_block = f"\n[Çapraz Referans - Bkz: {link_details['path']}]: {link_details['summary']}\n"
-                        aux_tokens = calculate_approx_tokens(aux_block)
-                        
-                        if current_token_count + aux_tokens <= total_token_budget:
-                            context_blocks.append(aux_block)
-                            current_token_count += aux_tokens
-                            trace.append(f"🔗 **DAG Bağlantısı Eklendi (Komşu):** `[{link_details['path']}]` özeti bağlama dahil edildi.")
 
     # Fallback RAG
     if fallback_triggered or not context_blocks:

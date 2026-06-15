@@ -204,7 +204,7 @@ CREATE TABLE toc_nodes (
 CREATE INDEX idx_nodes_parent ON toc_nodes(document_id, parent_id); -- hızlı çocuk getir
 CREATE INDEX idx_nodes_doc    ON toc_nodes(document_id, node_id);
 ```
-Not: İç düğümün başlık-altı "preamble" metni kaybolmasın diye, varsa sanal bir yaprak çocuğa ("X (giriş)") taşınır → "yalnız yaprak vektörlenir" kuralı korunur, bilgi kaybı olmaz.
+Not (Faz 2'de sadeleştirildi): Sanal yaprak yerine **içerik taşıyan her düğüm** (yaprak + iç düğüm preamble'ı) vektörlenir; `is_leaf` yalnızca navigasyonun daha derine inebileceğini belirtir. Böylece preamble kaybolmaz ve model sadeleşir. Derinlikten (`MAX_TREE_DEPTH`) taşan düğümler `finalize_tree` ile en yakın ataya markdown başlığıyla gömülür.
 
 **ChromaDB — `aegis_leaf_chunks` (yalnız yapraklar):**
 - `get_or_create_collection(..., metadata={"hnsw:space": "cosine"})` ← mevcut bug fix.

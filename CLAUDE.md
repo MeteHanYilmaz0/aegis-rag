@@ -44,19 +44,19 @@ Not: `benchmark_suite.py`'deki testlerin çoğu mock/sabit veriyle çalışır (
 
 ### Veri katmanı — iki depo birlikte (`src/database/db_manager.py`)
 Tek bir `DBManager` hem SQLite'ı hem ChromaDB'yi yönetir. **Her belge ikisine birden yazılır:**
-- **SQLite** (`db/aegis_rag.db`): `documents`, `toc_nodes` (hiyerarşik ağaç + her düğüm için ilk 3 cümlelik `summary`), `toc_links` (regex ile çıkarılan DAG çapraz referansları). Yapısal hattın kaynağı.
-- **ChromaDB** (`db/chroma_db/`): düğüm içerikleri `\n\n` ile paragraflara bölünüp `OllamaEmbeddingFunction` (nomic-embed-text) ile gömülür; metadata olarak `node_id`/`path` taşınır. Semantik hattın kaynağı. **İki hat `node_id` üzerinden kesişir** (heatmap bu eşlemeyle çizilir).
-- `OllamaEmbeddingFunction` Ollama erişilemezse sessizce `DefaultEmbeddingFunction`'a düşer — bu farklı embedding uzayı/boyutu demektir (bilinen kırılganlık).
+- **SQLite** (`db/aegis_rag.db`): `documents`, `toc_nodes` (hiyerarşik ağaç; her düğümde `summary`, `is_leaf`, `start_page`/`end_page`, `token_count`). Yapısal hattın kaynağı. Şema sürümü `SCHEMA_VERSION` (PRAGMA user_version); değişince tablolar düşürülür → yeniden indeksleme gerekir. WAL + `_write_lock` ile eşzamanlı yazma korunur. (`toc_links`/regex DAG **kaldırıldı**.)
+- **ChromaDB** (`db/chroma_db/`): **içerik taşıyan** düğümlerin içerikleri `\n\n` ile paragraflara bölünüp gömülür; metadata `node_id`/`path`/`heading`/`start_page` taşır. Embedding'ler `OllamaEmbedder` ile elle hesaplanıp Chroma'ya verilir (koleksiyonun kendi embedding fonksiyonu yok). **İki hat `node_id` üzerinden kesişir** (heatmap bu eşlemeyle çizilir; scoped arama `node_id ∈ {...}` ile yaprağa daraltılır).
+- `OllamaEmbedder` **fail-fast**'tir (Ollama yoksa hata fırlatır, sessiz fallback yok) ve nomic için `search_document:`/`search_query:` ön-eki uygular.
 
 ### Parse katmanı (`src/parser/toc_extractor.py`)
-İki statik aşama: `convert_pdf_to_markdown` (PyMuPDF ile font boyutu/kalınlık + koordinat analizi → Markdown; tabloları koordinatına göre araya yerleştirir; gövde font boyutunu belgenin **ortasından** örnekleyerek bulur — kapak/künye sayfalarının sahte başlık üretmesini engellemek için) ve `extract_toc_tree` (Markdown `#` başlıklarından stack tabanlı hiyerarşi + `path` üretir). Başlık tespiti şu an **span seviyesindedir** (over-segmentation kaynağı).
+Üst giriş noktası `extract_tree(pdf_path)`: önce gömülü TOC/yer imi (`doc.get_toc()`, ≥3 anlamlı giriş varsa) ile ağaç kurar; yoksa sezgisel yola düşer (`convert_pdf_to_markdown` → `extract_toc_tree`). `convert_pdf_to_markdown` font/koordinat analizi yapar; gövde font boyutunu belgenin **ortasından** örnekler. Başlık tespiti **satır seviyesindedir** (kısa + gövdeden büyük/kalın + cümle noktalamasıyla bitmeyen satır) — inline kalın kelimenin başlık sanılması (over-segmentation) giderildi. Tüm yollar `finalize_tree` ile sonlanır: **derinlik katlama** (`MAX_TREE_DEPTH`'ten derin düğümler ataya gömülür) + **`is_leaf`** işaretleme. `.md/.txt` için `extract_toc_tree` + `finalize_tree` ayrı çağrılır.
 
 ### Sorgu orkestrasyonu — 5 katman (`src/backend/main.py`, `/api/query`)
 Bu, sistemin kalbidir ve sırayla çalışır:
 1. **Execution Policy** (deterministik, LLM'siz): sorgudaki anahtar kelimelerden mod seçer — `Multi-Subtree Synthesis` (kıyaslama kelimeleri), `Hybrid Reranked Fallback` (<3 kelime), yoksa `Hierarchical Single-Node`.
 2. **Çift hat + heatmap**: ChromaDB top-10 → `lexical_semantic_rerank` (0.6·cosine + 0.4·kelime çakışması) → düğüm başına `hybrid_score` = heatmap.
 3. **Routing (LLM)**: ısı haritalı tüm ağaç + soru LLM'e verilir, okunacak `node_id` listesi + `confidence` döner. `confidence == LOW` veya boş liste → **fallback** tetiklenir.
-4. **Context Economy**: 4000 token katı bütçe. Seçilen düğümler (max 3) + DAG komşu **özetleri** eklenir; bütçe aşılırsa kırpılır. Fallback durumunda doğrudan reranked ChromaDB parçaları kullanılır.
+4. **Context Economy**: 4000 token katı bütçe. Seçilen düğümler (max 3) eklenir; bütçe aşılırsa kırpılır. Fallback durumunda doğrudan reranked ChromaDB parçaları kullanılır. (Not: Faz 3'te bu katman recursive descent + yaprak-içi scoped aramayla değişecek.)
 5. **Sentez + Local NLI**: LLM cevabı üretir, sonra aynı model cevabı bağlama karşı `CONSISTENT`/`CONTRADICTION` diye denetler; çelişkide cevaba uyarı notu eklenir.
 
 Yanıt; `answer` + `trace` (UI'da "Tree Trace" olarak gösterilen karar günlüğü) + `heatmap_scores` + `selected_node_ids` döner.
