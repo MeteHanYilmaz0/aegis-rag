@@ -52,10 +52,37 @@ Burada hiyerarşik PageIndex algoritması detaylandırılmıştır.
 
     def test_extract_toc_tree_content(self):
         nodes = TOCExtractor.extract_toc_tree(self.sample_markdown)
-        
+
         # İçerik eşleşmelerini kontrol et
         self.assertIn("ilk paragrafıdır", nodes[0]["content"])
         self.assertIn("PageIndex algoritması", nodes[3]["content"])
+
+
+class TestFinalizeTree(unittest.TestCase):
+    def test_is_leaf_marking(self):
+        nodes = TOCExtractor.extract_toc_tree(
+            "# A\nicerik a\n## A1\nicerik a1\n# B\nicerik b\n"
+        )
+        final = TOCExtractor.finalize_tree(nodes, max_depth=6)
+        by_h = {n["heading"]: n for n in final}
+        # A'nın çocuğu (A1) var → iç düğüm; A1 ve B yaprak
+        self.assertEqual(by_h["A"]["is_leaf"], 0)
+        self.assertEqual(by_h["A1"]["is_leaf"], 1)
+        self.assertEqual(by_h["B"]["is_leaf"], 1)
+
+    def test_depth_folding(self):
+        md = "# L1\nx\n## L2\ny\n### L3\nz\n#### L4\nderin icerik\n"
+        nodes = TOCExtractor.extract_toc_tree(md)
+        final = TOCExtractor.finalize_tree(nodes, max_depth=3)
+        headings = [n["heading"] for n in final]
+        # L4 katlanmalı (ayrı düğüm kalmamalı)
+        self.assertNotIn("L4", headings)
+        # L4'ün içeriği en yakın korunan ataya (L3) gömülmeli
+        l3 = next(n for n in final if n["heading"] == "L3")
+        self.assertIn("derin icerik", l3["content"])
+        # Katlama sonrası L3 yaprak olmalı (artık çocuğu yok)
+        self.assertEqual(l3["is_leaf"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

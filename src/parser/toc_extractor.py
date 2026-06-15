@@ -3,288 +3,351 @@ import re
 from typing import List, Dict, Any, Optional
 import fitz  # PyMuPDF
 
+from src import config
+
+
 class TOCExtractor:
     """
-    Markdown ve PDF dokümanlarından Hiyerarşik Ağaç (TOC) yapısı çıkaran gelişmiş modül.
-    Görsel düzen algılama (layout-aware), yazı boyutu/kalınlığı analizi ve 
-    gelişmiş tablo çıkarma yetenekleri sayesinde 1000+ sayfalık büyük ve karmaşık 
-    PDF'leri yüksek doğrulukla çözümler.
+    PDF/Markdown belgelerinden hiyerarşik ağaç (TOC) çıkaran modül.
+
+    Hiyerarşi kaynağı üç katmanlı önceliklendirme ile belirlenir (bkz. project_brain.md §6.2):
+      1. Gömülü TOC / yer imi (`doc.get_toc()`) — en güvenilir, varsa öncelikli.
+      2. Sezgisel: layout/font-boyutu analizi ile Markdown başlık çıkarımı.
+    Çıkan ağaç `finalize_tree` ile sonlandırılır: derinlik sınırı (katlama) + yaprak işaretleme.
     """
 
+    # ------------------------------------------------------------------ #
+    #  Üst seviye giriş noktası
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def extract_tree(pdf_path: str, progress_callback=None, max_depth: int = None) -> List[Dict[str, Any]]:
+        """
+        Bir PDF'ten sonlandırılmış hiyerarşik ağacı döndürür.
+        Önce gömülü yer imlerini dener; yetersizse sezgisel Markdown yoluna düşer.
+        """
+        if max_depth is None:
+            max_depth = config.MAX_TREE_DEPTH
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"PDF dosyası bulunamadı: {pdf_path}")
+
+        doc = fitz.open(pdf_path)
+        try:
+            toc = doc.get_toc(simple=True)
+            meaningful = [
+                e for e in toc
+                if e[1] and e[1].strip()
+                and e[1].strip().lower() not in ("boş sayfa", "bos sayfa", "blank page")
+            ]
+            # Yer imleri ancak anlamlı sayıda girişe sahipse güvenilir kabul edilir.
+            if len(meaningful) >= 3:
+                nodes = TOCExtractor._build_from_bookmarks(doc, meaningful)
+            else:
+                markdown = TOCExtractor.convert_pdf_to_markdown(pdf_path, progress_callback=progress_callback)
+                nodes = TOCExtractor.extract_toc_tree(markdown)
+        finally:
+            doc.close()
+
+        return TOCExtractor.finalize_tree(nodes, max_depth)
+
+    # ------------------------------------------------------------------ #
+    #  1. Yol: Gömülü yer imlerinden ağaç
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _build_from_bookmarks(doc, entries: List[List[Any]]) -> List[Dict[str, Any]]:
+        """
+        `doc.get_toc()` çıktısından (her giriş: [level, title, page]) ağaç kurar.
+        Her düğümün içeriği, kendi başlangıç sayfasından bir sonraki girişin sayfasına
+        kadar olan metindir (preamble dahil; çocuklar sonraki girişlerde gelir).
+        """
+        nodes: List[Dict[str, Any]] = []
+        stack: Dict[int, int] = {}  # level -> node listesi indeksi
+        page_count = len(doc)
+
+        for i, (level, title, page) in enumerate(entries):
+            title = title.strip()
+            start_page = max(1, page)                       # 1-tabanlı
+            next_page = entries[i + 1][2] if i + 1 < len(entries) else page_count + 1
+            end_page = max(start_page, min(page_count, next_page - 1))
+
+            # İçerik metni: [start_page-1 .. next_page-1) (0-tabanlı) sayfa aralığı.
+            start_idx = start_page - 1
+            end_idx = min(page_count, next_page - 1)
+            content = "\n".join(
+                doc[p].get_text() for p in range(start_idx, end_idx)
+            ).strip() if end_idx > start_idx else ""
+
+            parent_idx = None
+            parent_path = ""
+            for l in range(level - 1, 0, -1):
+                if l in stack:
+                    parent_idx = stack[l]
+                    parent_path = nodes[parent_idx]["path"]
+                    break
+
+            full_path = f"{parent_path} > {title}" if parent_path else title
+            node_idx = len(nodes)
+            nodes.append({
+                "id": node_idx + 1,
+                "heading": title,
+                "level": level,
+                "parent_id": nodes[parent_idx]["id"] if parent_idx is not None else None,
+                "path": full_path,
+                "content": content,
+                "start_page": start_page,
+                "end_page": end_page,
+                "start_line": None,
+                "end_line": None,
+            })
+            stack[level] = node_idx
+            for l in list(stack.keys()):
+                if l > level:
+                    del stack[l]
+
+        return nodes
+
+    # ------------------------------------------------------------------ #
+    #  2. Yol: Sezgisel PDF -> Markdown
+    # ------------------------------------------------------------------ #
     @staticmethod
     def is_rect_inside(rect_a, rect_b) -> bool:
-        """A dikdörtgeninin B dikdörtgeninin içinde veya çok yakınında olup olmadığını kontrol eder."""
-        # rect = (x0, y0, x1, y1)
-        return (rect_a[0] >= rect_b[0] - 2 and 
-                rect_a[1] >= rect_b[1] - 2 and 
-                rect_a[2] <= rect_b[2] + 2 and 
+        """A dikdörtgeninin B dikdörtgeninin içinde (küçük toleransla) olup olmadığını kontrol eder."""
+        return (rect_a[0] >= rect_b[0] - 2 and
+                rect_a[1] >= rect_b[1] - 2 and
+                rect_a[2] <= rect_b[2] + 2 and
                 rect_a[3] <= rect_b[3] + 2)
+
+    @staticmethod
+    def _heading_level(max_size: float, body_size: float, line_text: str, numbering) -> int:
+        """Başlık seviyesini yazı boyutu farkından (veya numaralandırmadan) hesaplar."""
+        if numbering:
+            dots = line_text.split()[0].count(".")
+            return min(5, max(1, dots + 1))
+        diff = max_size - body_size
+        if diff >= 6.0:
+            return 1
+        if diff >= 4.0:
+            return 2
+        if diff >= 2.0:
+            return 3
+        if diff >= 0.5:
+            return 4
+        return 5
 
     @staticmethod
     def convert_pdf_to_markdown(pdf_path: str, progress_callback=None) -> str:
         """
-        PDF dosyasını sayfa sayfa akışkan (streaming) olarak işler.
-        Yazı boyutu (font size), yazı tipi kalınlığı (bold/flags) ve sayfa koordinatlarını analiz ederek
-        okuma sırasına göre başlıkları ve gelişmiş tabloları Markdown formatına dönüştürür.
-        1000+ sayfalık dokümanlarda bellek dostu çalışır.
+        PDF'i sayfa sayfa Markdown'a çevirir. Başlık tespiti **satır seviyesindedir**:
+        bir satır ancak kısa + gövdeden büyük/kalın + cümle noktalamasıyla bitmiyorsa
+        başlık sayılır. Bu, paragraf içi tek bir kalın kelimenin başlık sanılmasını
+        (over-segmentation) engeller. Tablolar koordinatına göre araya yerleştirilir.
+        Sayfa sınırları `<!-- Page N -->` yorumlarıyla işaretlenir.
         """
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"PDF dosyası bulunamadı: {pdf_path}")
 
         doc = fitz.open(pdf_path)
         markdown_lines = []
-        
-        # 1. Aşama: Yazı boyutlarını analiz ederek varsayılan gövde metni (body text) boyutunu bulalım.
-        # Belgenin ortasından ve çeşitli sayfalarından örnekler alarak en doğru gövde font boyutunu buluruz.
+
+        # 1. Aşama: gövde (body) yazı boyutunu belirle.
+        # Kitaplarda ilk sayfalar telif/künye olduğundan, belgenin ortasından örnekleriz.
         font_sizes = []
         if len(doc) <= 5:
             sample_pages = list(range(len(doc)))
         else:
-            # Kitaplarda ilk sayfalar telif/giriş olduğundan küçük fontludur.
-            # Sayfa sayısının %10'undan başlayarak eşit aralıklarla 10 sayfa örnekleyelim.
             start_page = max(1, len(doc) // 10)
             step = max(1, (len(doc) - start_page) // 10)
             sample_pages = [i for i in range(start_page, len(doc), step)][:10]
-            
+
         for i in sample_pages:
             page_dict = doc[i].get_text("dict")
             for block in page_dict.get("blocks", []):
                 for line in block.get("lines", []):
                     for span in line.get("spans", []):
                         font_sizes.append(round(span.get("size", 10), 1))
-        
-        # En sık tekrarlanan yazı boyutunu (mode) gövde boyutu olarak belirle
+
         if font_sizes:
             from collections import Counter
             body_font_size = Counter(font_sizes).most_common(1)[0][0]
         else:
             body_font_size = 10.0
 
-        # 2. Aşama: Sayfa sayfa yüksek doğruluklu dönüştürme işlemi
+        # 2. Aşama: sayfa sayfa dönüştürme
         for page_idx, page in enumerate(doc):
             if progress_callback:
                 progress_callback(page_idx + 1, len(doc))
             markdown_lines.append(f"\n<!-- Page {page_idx + 1} -->\n")
-            
-            # A) Sayfadaki tabloları gelişmiş motor ile bul ve koordinatlarını kaydet
+
+            # A) Tabloları bul ve koordinatlarını sakla
             tables = page.find_tables()
             table_rects = []
             page_tables_markdown = {}
-            
-            for t_idx, table in enumerate(tables):
-                table_rects.append(table.bbox) # (x0, y0, x1, y1)
-                
-                # Tablo verisini Markdown tablosuna çevir
+            for table in tables:
+                table_rects.append(table.bbox)
                 table_data = table.extract()
                 if not table_data or len(table_data) < 1:
                     continue
-                    
                 table_md = []
                 col_count = len(table_data[0])
-                
                 for r_idx, row in enumerate(table_data):
-                    # None değerleri boş stringe çevir
-                    clean_row = [str(cell).replace("\n", " ").strip() if cell is not None else "" for cell in row]
+                    clean_row = [str(c).replace("\n", " ").strip() if c is not None else "" for c in row]
                     table_md.append("| " + " | ".join(clean_row) + " |")
                     if r_idx == 0:
-                        # Seperatör satırı
                         table_md.append("| " + " | ".join(["---"] * col_count) + " |")
-                
-                # Bu tablonun y koordinatına göre sayfaya yerleştirilmek üzere kaydet
                 page_tables_markdown[table.bbox[1]] = "\n" + "\n".join(table_md) + "\n"
 
-            # B) Sayfadaki tüm yazıları zengin sözlük (dict) formatında çek
+            # B) Metin bloklarını oku ve okuma sırasına göre sırala
             page_dict = page.get_text("dict")
             blocks = page_dict.get("blocks", [])
-            
-            # Blokları okuma sırasına göre sırala (Yukarıdan aşağıya, soldan sağa)
-            # 2 sütunlu düzenleri de desteklemek için y koordinatı toleranslı sıralama yaparız
             blocks.sort(key=lambda b: (round(b["bbox"][1] / 10) * 10, b["bbox"][0]))
-            
+
             rendered_table_coords = set()
-            
+
             for block in blocks:
-                # Eğer blok bir görsel veya metin içermiyorsa atla
-                if block.get("type") != 0: # 0 = Metin bloğu
+                if block.get("type") != 0:  # 0 = metin bloğu
                     continue
-                
                 block_bbox = block["bbox"]
-                
-                # C) Eğer bu blok herhangi bir tablonun İÇİNDEYSE, çift yazdırmamak için atla
-                is_inside_table = False
-                for t_rect in table_rects:
-                    if TOCExtractor.is_rect_inside(block_bbox, t_rect):
-                        is_inside_table = True
-                        break
-                if is_inside_table:
+
+                # Tablonun içindeki blokları atla (çift yazımı önle)
+                if any(TOCExtractor.is_rect_inside(block_bbox, t) for t in table_rects):
                     continue
-                
-                # Blok içindeki satırları birleştirerek paragrafı/başlığı oluştur
-                block_text_runs = []
-                
-                for line in block.get("lines", []):
-                    line_spans = line.get("spans", [])
-                    for span in line_spans:
-                        text = span.get("text", "").strip()
-                        if not text:
-                            continue
-                            
-                        size = span.get("size", 10.0)
-                        flags = span.get("flags", 0)
-                        is_bold = bool(flags & 2) # fitz bold bayrağı
-                        
-                        # D) Gelişmiş Başlık Tespiti (Font Boyutu, Kalınlık ve Desen Analizi)
-                        # Eğer yazı boyutu gövde metninden büyükse ve kalınsa başlık olma ihtimali yüksektir
-                        is_likely_heading = (size > body_font_size + 1.5) or (size > body_font_size + 0.5 and is_bold)
-                        
-                        # Sayısal/Hiyerarşik başlık deseni kontrolü (Örn: 1. Giriş veya 2.1.2 Metot)
-                        numbering_pattern = re.match(r'^\d+(\.\d+){0,4}\.?\s+[A-ZÇĞİÖŞÜa-zçğıöşü]', text)
-                        
-                        if is_likely_heading or numbering_pattern:
-                            # Seviye hesaplama (Yazı boyutuna göre kademelendir)
-                            diff = size - body_font_size
-                            if diff >= 6.0:
-                                level = 1
-                            elif diff >= 4.0:
-                                level = 2
-                            elif diff >= 2.0:
-                                level = 3
-                            elif diff >= 0.5:
-                                level = 4
-                            else:
-                                level = 5
-                                
-                            # Eğer numaralandırma deseni varsa, seviyeyi oradan da teyit et
-                            if numbering_pattern:
-                                dots_count = text.split()[0].count('.')
-                                # Nokta sayısına göre seviyeyi ayarla
-                                level = min(5, max(1, dots_count + 1))
-                            
-                            hashes = "#" * level
-                            block_text_runs.append(f"\n{hashes} {text}\n")
-                        else:
-                            # Normal metin
-                            # Kalın kelimeleri markdown kalın yapalım
-                            if is_bold and len(text) < 30:
-                                block_text_runs.append(f" **{text}** ")
-                            else:
-                                block_text_runs.append(text)
-                
-                block_content = " ".join(block_text_runs).strip()
-                # Çoklu boşlukları temizle ve düzelt
-                block_content = re.sub(r'\s+', ' ', block_content)
-                block_content = block_content.replace(" \n ", "\n").replace("\n ", "\n").replace(" \n", "\n")
-                
-                # Tabloları araya doğru y koordinatında yerleştirme mantığı
-                # Eğer bloğumuzun y koordinatı bir tablonun y koordinatını geçtiyse, o tabloyu araya bas
+
+                # Bekleyen tabloları doğru y konumunda araya bas
                 for t_y in list(page_tables_markdown.keys()):
                     if t_y < block_bbox[1] and t_y not in rendered_table_coords:
                         markdown_lines.append(page_tables_markdown[t_y])
                         rendered_table_coords.add(t_y)
-                
-                if block_content:
-                    markdown_lines.append(f"\n{block_content}\n")
-            
-            # Sayfa bittiğinde henüz yazdırılmamış tablolar varsa sayfaya ekle
+
+                # Bloğu SATIR SATIR işle: başlıkları ayır, gövdeyi biriktir
+                body_parts: List[str] = []
+                for line in block.get("lines", []):
+                    spans = [s for s in line.get("spans", []) if s.get("text", "").strip()]
+                    if not spans:
+                        continue
+                    line_text = re.sub(r"\s+", " ", " ".join(s["text"].strip() for s in spans)).strip()
+                    if not line_text:
+                        continue
+
+                    max_size = max(s.get("size", 10.0) for s in spans)
+                    total_chars = sum(len(s["text"]) for s in spans) or 1
+                    bold_chars = sum(len(s["text"]) for s in spans if (s.get("flags", 0) & 2))
+                    bold_ratio = bold_chars / total_chars
+
+                    word_count = len(line_text.split())
+                    ends_sentence = line_text[-1] in ".!?,:;"
+                    numbering = re.match(r"^\d+(\.\d+){0,4}\.?\s+[^\d\s]", line_text)
+
+                    is_short = word_count <= 14 and len(line_text) <= 120
+                    big = max_size > body_font_size + 1.5
+                    bold_big = max_size > body_font_size + 0.5 and bold_ratio > 0.6
+                    is_heading = is_short and not ends_sentence and (big or bold_big or bool(numbering))
+
+                    if is_heading:
+                        if body_parts:
+                            markdown_lines.append("\n" + " ".join(body_parts).strip() + "\n")
+                            body_parts = []
+                        level = TOCExtractor._heading_level(max_size, body_font_size, line_text, numbering)
+                        markdown_lines.append(f"\n{'#' * level} {line_text}\n")
+                    else:
+                        body_parts.append(line_text)
+
+                if body_parts:
+                    markdown_lines.append("\n" + " ".join(body_parts).strip() + "\n")
+
+            # Sayfa sonunda kalan tabloları ekle
             for t_y, t_md in page_tables_markdown.items():
                 if t_y not in rendered_table_coords:
                     markdown_lines.append(t_md)
                     rendered_table_coords.add(t_y)
 
-        # Tüm satırları birleştir ve gereksiz boşlukları optimize et
+        doc.close()
         full_markdown = "\n".join(markdown_lines)
-        full_markdown = re.sub(r'\n{3,}', '\n\n', full_markdown)
+        full_markdown = re.sub(r"\n{3,}", "\n\n", full_markdown)
         return full_markdown.strip()
 
     @staticmethod
     def extract_toc_tree(markdown_text: str) -> List[Dict[str, Any]]:
         """
-        Markdown metninden kural tabanlı olarak H1-H5 başlık hiyerarşisini çıkarır.
-        Düzleştirilmiş ağaç (Flat-Tree Selection) için her düğümün üst düğümünü,
-        hiyerarşik yolunu (path), satır aralığını ve içeriğini belirler.
+        Markdown'dan H1-H5 başlık hiyerarşisini stack tabanlı çıkarır.
+        `<!-- Page N -->` işaretlerini izleyerek her düğüme başlangıç/bitiş sayfası atar.
         """
-        lines = markdown_text.split('\n')
+        lines = markdown_text.split("\n")
         nodes: List[Dict[str, Any]] = []
-        
-        # Hiyerarşiyi takip etmek için bir yığın (stack) tutuyoruz.
-        # stack[level] = node_index
         stack: Dict[int, int] = {}
-        
         current_node: Optional[Dict[str, Any]] = None
-        
+        current_page = 1
+
         for line_idx, line in enumerate(lines):
             line_num = line_idx + 1
-            # Başlık satırını kontrol et (örn: # Başlık, ## Başlık)
-            match = re.match(r'^(#{1,5})\s+(.+)$', line.strip())
-            
+            stripped = line.strip()
+
+            # Sayfa işareti: içeriğe yazma, sadece sayfa sayacını güncelle
+            page_match = re.match(r"<!--\s*Page\s+(\d+)\s*-->", stripped)
+            if page_match:
+                current_page = int(page_match.group(1))
+                if current_node is not None:
+                    current_node["end_page"] = current_page
+                continue
+
+            match = re.match(r"^(#{1,5})\s+(.+)$", stripped)
             if match:
-                # Önceki aktif düğümün bitiş satırını güncelle
                 if current_node:
-                    current_node['end_line'] = line_num - 1
+                    current_node["end_line"] = line_num - 1
+                    current_node["end_page"] = current_page
 
                 hashes, heading_text = match.groups()
                 level = len(hashes)
                 heading_text = heading_text.strip()
-                
-                # Parent tespiti: Kendinden küçük seviyedeki en son aktif başlığı bul
+
                 parent_idx = None
                 parent_path = ""
                 for l in range(level - 1, 0, -1):
                     if l in stack:
                         parent_idx = stack[l]
-                        parent_path = nodes[parent_idx]['path']
+                        parent_path = nodes[parent_idx]["path"]
                         break
-                
-                # Tam hiyerarşik yol (path) hesapla
+
                 full_path = f"{parent_path} > {heading_text}" if parent_path else heading_text
-                
                 node_idx = len(nodes)
                 new_node = {
                     "id": node_idx + 1,
                     "heading": heading_text,
                     "level": level,
-                    "parent_id": nodes[parent_idx]['id'] if parent_idx is not None else None,
+                    "parent_id": nodes[parent_idx]["id"] if parent_idx is not None else None,
                     "path": full_path,
                     "content_lines": [],
                     "start_line": line_num,
-                    "end_line": len(lines)  # Şimdilik son satıra kadar varsayalım
+                    "end_line": len(lines),
+                    "start_page": current_page,
+                    "end_page": current_page,
                 }
-                
                 nodes.append(new_node)
                 stack[level] = node_idx
-                
-                # Kendinden daha derin tüm seviyeleri yığından temizle
                 for l in list(stack.keys()):
                     if l > level:
                         del stack[l]
-                        
                 current_node = new_node
             else:
-                # Başlık olmayan satırları aktif düğüme ekle
                 if current_node:
-                    current_node['content_lines'].append(line)
-                else:
-                    # Eğer henüz hiç başlık yoksa ve içerik varsa, sanal bir "Giriş" düğümü açalım
-                    if line.strip():
-                        current_node = {
-                            "id": 1,
-                            "heading": "Giriş",
-                            "level": 1,
-                            "parent_id": None,
-                            "path": "Giriş",
-                            "content_lines": [line],
-                            "start_line": 1,
-                            "end_line": len(lines)
-                        }
-                        nodes.append(current_node)
-                        stack[1] = 0
+                    current_node["content_lines"].append(line)
+                elif stripped:
+                    current_node = {
+                        "id": 1,
+                        "heading": "Giriş",
+                        "level": 1,
+                        "parent_id": None,
+                        "path": "Giriş",
+                        "content_lines": [line],
+                        "start_line": 1,
+                        "end_line": len(lines),
+                        "start_page": current_page,
+                        "end_page": current_page,
+                    }
+                    nodes.append(current_node)
+                    stack[1] = 0
 
-        # Kalan içerik satırlarını birleştirip 'content' alanına yazalım ve son end_line'ları netleştirelim
         for node in nodes:
-            node['content'] = "\n".join(node['content_lines']).strip()
-            del node['content_lines']  # Bellek optimizasyonu
+            node["content"] = "\n".join(node.pop("content_lines")).strip()
 
-        # Eğer hiç düğüm çıkarılamadıysa boş dönmesin, tüm belgeyi tek düğüm yapalım
         if not nodes:
             nodes.append({
                 "id": 1,
@@ -294,7 +357,64 @@ class TOCExtractor:
                 "path": "Belge İçeriği",
                 "content": markdown_text.strip(),
                 "start_line": 1,
-                "end_line": len(lines)
+                "end_line": len(lines),
+                "start_page": 1,
+                "end_page": current_page,
             })
 
         return nodes
+
+    # ------------------------------------------------------------------ #
+    #  Ortak: ağaç sonlandırma (derinlik katlama + yaprak işaretleme)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def finalize_tree(nodes: List[Dict[str, Any]], max_depth: int) -> List[Dict[str, Any]]:
+        """
+        Ağacı sonlandırır:
+          1. Derinlik katlama: `max_depth`'ten derin düğümler en yakın korunan ataya
+             (markdown başlığıyla) gömülür — ağaç sığ ve gezinilebilir kalır.
+          2. parent_id'leri korunan düğümlere yeniden bağlar.
+          3. `is_leaf` işaretler (çocuğu olmayan düğüm = yaprak).
+        Not: İçerik taşıyan her düğüm (iç düğüm preamble'ı dahil) vektörlenebilir;
+        `is_leaf` yalnızca navigasyonun daha derine inebileceğini belirtir.
+        """
+        if not nodes:
+            return nodes
+
+        by_id = {n["id"]: n for n in nodes}
+
+        # 1. Derinlik katlama
+        kept = []
+        for n in nodes:
+            if n["level"] <= max_depth:
+                kept.append(n)
+            else:
+                anc = n
+                while anc is not None and anc["level"] > max_depth:
+                    anc = by_id.get(anc["parent_id"])
+                if anc is not None:
+                    folded = f"\n\n{'#' * n['level']} {n['heading']}\n{n.get('content', '')}".rstrip()
+                    anc["content"] = (anc.get("content", "") + folded).strip()
+                    if n.get("end_page") is not None:
+                        anc["end_page"] = n["end_page"]
+
+        kept_ids = {n["id"] for n in kept}
+
+        # 2. parent_id'leri korunan ataya yeniden bağla
+        for n in kept:
+            pid = n["parent_id"]
+            while pid is not None and pid not in kept_ids:
+                pid = by_id[pid]["parent_id"] if pid in by_id else None
+            n["parent_id"] = pid
+
+        # 3. is_leaf işaretle
+        parents_with_children = {n["parent_id"] for n in kept if n["parent_id"] is not None}
+        for n in kept:
+            n["is_leaf"] = 0 if n["id"] in parents_with_children else 1
+            n.setdefault("content", "")
+            n.setdefault("start_page", None)
+            n.setdefault("end_page", None)
+            n.setdefault("start_line", None)
+            n.setdefault("end_line", None)
+
+        return kept
