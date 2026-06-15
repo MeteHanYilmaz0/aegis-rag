@@ -22,7 +22,7 @@ EMBED_MODEL = os.getenv("AEGIS_EMBED_MODEL", "nomic-embed-text")  # alternatif: 
 # Düğüm özetleri: True ise indekslemede her düğüm için LLM özeti üretilir (navigasyon
 # kalitesini artırır ama indekslemeyi yavaşlatır). False ise hızlı çıkarımsal (ilk N cümle)
 # özet kullanılır. LLM çağrısı başarısız olursa otomatik çıkarımsal özete düşülür.
-USE_LLM_SUMMARIES = os.getenv("AEGIS_USE_LLM_SUMMARIES", "false").lower() == "true"
+USE_LLM_SUMMARIES = os.getenv("AEGIS_USE_LLM_SUMMARIES", "true").lower() == "true"
 
 # Thinking modelleri (qwen3 vb.) düşünce çıktısını JSON/sentez yanıtına sızdırmasın.
 LLM_THINKING = False

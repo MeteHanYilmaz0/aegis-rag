@@ -32,22 +32,40 @@ class TOCExtractor:
 
         doc = fitz.open(pdf_path)
         try:
+            page_count = len(doc)
             toc = doc.get_toc(simple=True)
             meaningful = [
                 e for e in toc
                 if e[1] and e[1].strip()
                 and e[1].strip().lower() not in ("boş sayfa", "bos sayfa", "blank page")
             ]
-            # Yer imleri ancak anlamlı sayıda girişe sahipse güvenilir kabul edilir.
-            if len(meaningful) >= 3:
+            if TOCExtractor._bookmarks_usable(meaningful, page_count):
                 nodes = TOCExtractor._build_from_bookmarks(doc, meaningful)
             else:
-                markdown = TOCExtractor.convert_pdf_to_markdown(pdf_path, progress_callback=progress_callback)
-                nodes = TOCExtractor.extract_toc_tree(markdown)
+                nodes = None  # sezgisel yol (doc'u kapatıp ayrı açacağız)
         finally:
             doc.close()
 
+        if nodes is None:
+            markdown = TOCExtractor.convert_pdf_to_markdown(pdf_path, progress_callback=progress_callback)
+            nodes = TOCExtractor.extract_toc_tree(markdown)
+
         return TOCExtractor.finalize_tree(nodes, max_depth)
+
+    @staticmethod
+    def _bookmarks_usable(meaningful: List[List[Any]], page_count: int) -> bool:
+        """
+        Gömülü yer imleri güvenilir mi? Yer imleri ancak (a) yeterli sayıda ve (b) makul
+        dağılımlıysa kullanılır. Slayt destelerinde olduğu gibi yer imleri seyrek/yanlış
+        yerleşmişse (örn. bir bölüm belgenin >%25'ini kaplıyorsa), içerik dilimleri kayar
+        → bu durumda daha ince ve hizalı yapı veren sezgisel yola düşülür.
+        """
+        if len(meaningful) < 3 or page_count <= 0:
+            return False
+        pages = sorted(e[2] for e in meaningful)
+        bounds = pages + [page_count + 1]
+        max_slice = max(bounds[i + 1] - bounds[i] for i in range(len(pages)))
+        return (max_slice / page_count) <= 0.25
 
     # ------------------------------------------------------------------ #
     #  1. Yol: Gömülü yer imlerinden ağaç
@@ -200,6 +218,21 @@ class TOCExtractor:
             blocks = page_dict.get("blocks", [])
             blocks.sort(key=lambda b: (round(b["bbox"][1] / 10) * 10, b["bbox"][0]))
 
+            # Sayfa-içi baskın (gövde) font boyutu. Slaytlarda fontlar globalde büyük
+            # olduğundan mutlak eşik başlıkları kaçırır; sayfa-içi GÖRECELI oran daha
+            # güvenilirdir (başlık, o slayttaki gövde metinden belirgin büyüktür).
+            page_span_sizes = [
+                round(s.get("size", 10.0), 1)
+                for b in blocks if b.get("type") == 0
+                for ln in b.get("lines", [])
+                for s in ln.get("spans", []) if s.get("text", "").strip()
+            ]
+            if page_span_sizes:
+                from collections import Counter as _Counter
+                page_body_size = _Counter(page_span_sizes).most_common(1)[0][0]
+            else:
+                page_body_size = body_font_size
+
             rendered_table_coords = set()
 
             for block in blocks:
@@ -236,16 +269,30 @@ class TOCExtractor:
                     ends_sentence = line_text[-1] in ".!?,:;"
                     numbering = re.match(r"^\d+(\.\d+){0,4}\.?\s+[^\d\s]", line_text)
 
-                    is_short = word_count <= 14 and len(line_text) <= 120
-                    big = max_size > body_font_size + 1.5
+                    is_short = word_count <= 18 and len(line_text) <= 140
+                    big = max_size > body_font_size + 1.5                       # global (kitap)
                     bold_big = max_size > body_font_size + 0.5 and bold_ratio > 0.6
-                    is_heading = is_short and not ends_sentence and (big or bold_big or bool(numbering))
+                    # Sayfa-içi göreceli: satır, o sayfanın gövde fontundan belirgin büyük mü?
+                    size_ratio = max_size / page_body_size if page_body_size else 1.0
+                    page_relative = size_ratio >= 1.18
+                    is_heading = is_short and not ends_sentence and (big or bold_big or page_relative or bool(numbering))
 
                     if is_heading:
                         if body_parts:
                             markdown_lines.append("\n" + " ".join(body_parts).strip() + "\n")
                             body_parts = []
                         level = TOCExtractor._heading_level(max_size, body_font_size, line_text, numbering)
+                        # Sadece sayfa-göreceli sinyalle yakalanan (slayt) başlıklarda mutlak
+                        # fark küçük olabilir; seviyeyi orana göre de değerlendir, daha belirgini al.
+                        if not numbering:
+                            if size_ratio >= 1.6:
+                                level = min(level, 1)
+                            elif size_ratio >= 1.4:
+                                level = min(level, 2)
+                            elif size_ratio >= 1.25:
+                                level = min(level, 3)
+                            elif page_relative:
+                                level = min(level, 4)
                         markdown_lines.append(f"\n{'#' * level} {line_text}\n")
                     else:
                         body_parts.append(line_text)

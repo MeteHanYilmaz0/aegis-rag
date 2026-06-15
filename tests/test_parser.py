@@ -84,5 +84,21 @@ class TestFinalizeTree(unittest.TestCase):
         self.assertEqual(l3["is_leaf"], 1)
 
 
+class TestBookmarksUsable(unittest.TestCase):
+    def test_too_few_bookmarks(self):
+        # 1 anlamlı yer imi -> kullanılamaz
+        self.assertFalse(TOCExtractor._bookmarks_usable([[1, "A", 1]], 100))
+
+    def test_sparse_bookmarks_rejected(self):
+        # Sunum benzeri: bir bölüm belgenin >%25'ini kaplıyor -> sezgisele düş
+        entries = [[1, "Gündem", 2], [1, "Bölüm", 23], [1, "Son", 55]]
+        self.assertFalse(TOCExtractor._bookmarks_usable(entries, 57))
+
+    def test_dense_bookmarks_accepted(self):
+        # Kitap benzeri: dengeli dağılmış yer imleri -> kullan
+        entries = [[1, f"Bölüm {i}", i * 8] for i in range(1, 13)]  # 12 giriş, ~8 sayfa arayla
+        self.assertTrue(TOCExtractor._bookmarks_usable(entries, 100))
+
+
 if __name__ == "__main__":
     unittest.main()
