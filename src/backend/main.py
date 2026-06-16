@@ -464,29 +464,31 @@ def query_aegis(payload: QueryRequest):
     targets, confidence, descended = run_recursive_descent(
         document_id, query, children_map, node_map, descent_heatmap, model_name, trace
     )
-    fallback_triggered = (not targets) or confidence == "LOW"
-    if fallback_triggered:
-        trace.append("⚠️ **Descent sonuçsuz / düşük güven → Semantik Fallback'e geçiliyor.**")
-    else:
+    descent_ok = bool(targets) and confidence != "LOW"
+    if descent_ok:
         trace.append(f"🎯 **Descent tamamlandı:** hedef düğümler {sorted(targets)} (güven: {confidence}).")
+    else:
+        trace.append("⚠️ **Descent zayıf/sonuçsuz → ısı haritası kapsamına geçiliyor.**")
 
     # ==========================================
-    # 3. Bağlam: hedef özetleri + yaprak-içi scoped pasajlar (Context Economy)
+    # 3. Bağlam: özetler + kapsam-içi pasajlar (Context Economy)
     # ==========================================
     context_blocks = []
     current_token_count = 0
     budget = config.TOKEN_BUDGET
 
-    if not fallback_triggered:
-        # 3a. Özetler: inilen bölüm başlıkları + seçilen hedefler. En SIĞ düğümler
-        # (bölüm başlıkları) önce gelsin ki "listele/genel-bakış" sorularında tüm
-        # bölümler görünsün (derin alt-düğümler özet bloğunu doldurup bölümleri düşürmesin).
-        # Özetlere bütçenin yarısı ayrılır; kalanı pasajlara.
+    # ÇİFT-HAT KESİŞİMİ: kapsam = yapısal hedefler (descent) ∪ ısı-haritası zirvesi.
+    # Descent yanlış dala inse bile (örn. tez Q3: descent ch5'e indi ama içerik ch3'te,
+    # ısı ch3'ü işaret etti) vektör sinyali telafi eder.
+    heatmap_top = [nid for nid, _ in sorted(heatmap_scores.items(), key=lambda kv: kv[1], reverse=True)[:3]]
+    structural_roots = set(targets) | set(descended)
+    scope_roots = structural_roots | set(heatmap_top)
+
+    if scope_roots:
+        # 3a. Özetler: önce yapısal hedefler (en sığ = bölüm başlıkları), sonra ısı-zirvesi.
         summary_budget = int(budget * 0.5)
-        summary_ids = sorted(
-            set(targets) | set(descended),
-            key=lambda i: (node_map[i]["level"] if i in node_map else 99, i),
-        )
+        summary_ids = sorted(structural_roots, key=lambda i: (node_map[i]["level"] if i in node_map else 99, i))
+        summary_ids += [n for n in heatmap_top if n not in structural_roots]
         for tid in summary_ids:
             node = node_map.get(tid)
             summ = (node.get("summary") or "").strip() if node else ""
@@ -497,9 +499,9 @@ def query_aegis(payload: QueryRequest):
                     context_blocks.append(block)
                     current_token_count += t
 
-        # 3b. Yaprak-içi scoped pasaj araması (seçilen + inilen alt-ağaçlar İÇİNDE)
-        scope = list(_subtree_ids(set(targets) | set(descended), children_map))
-        scoped = db_manager.query_chroma(document_id, query, top_k=config.RERANK_TOP_K * 2, node_ids=scope)
+        # 3b. Kapsam-içi scoped pasaj araması (yapısal + ısı-zirvesi alt-ağaçları İÇİNDE)
+        scope = list(_subtree_ids(scope_roots, children_map))
+        scoped = db_manager.query_chroma(document_id, query, top_k=config.SCOPED_TOP_K, node_ids=scope)
         scoped = lexical_semantic_rerank(query, scoped, top_k=config.RERANK_TOP_K)
         for res in scoped:
             meta = res["metadata"]
@@ -512,12 +514,11 @@ def query_aegis(payload: QueryRequest):
                 current_token_count += t
             else:
                 break
-        trace.append(f"🔎 **Yaprak-içi arama:** {len(scope)} düğümlük kapsamda {len(scoped)} pasaj değerlendirildi.")
+        trace.append(f"🔎 **Kapsam-içi arama:** {len(scope)} düğüm (yapısal {sorted(structural_roots) or '-'} + ısı {heatmap_top}) → {len(scoped)} pasaj.")
 
-    # 3c. Fallback: tüm belge üzerinde semantik (descent boşsa veya bağlam boş kaldıysa)
-    if fallback_triggered or not context_blocks:
-        fallback_triggered = True
-        trace.append("🔍 **ChromaDB Vektör Havuzundan (global) okuma yapılıyor...**")
+    # 3c. Tam global fallback: ne yapısal hedef ne ısı sinyali varsa
+    if not context_blocks:
+        trace.append("🔍 **Global ChromaDB okuması (kapsam yok)...**")
         for idx, res in enumerate(reranked_hits):
             meta = res["metadata"]
             page = meta.get("start_page")
@@ -530,6 +531,7 @@ def query_aegis(payload: QueryRequest):
             else:
                 break
 
+    fallback_triggered = not descent_ok
     trace.append(f"📊 **Context Economy:** {current_token_count} / {budget} yaklaşık token.")
 
     # ==========================================
@@ -559,10 +561,13 @@ KURALLAR:
         answer = f"Sorgu işlenirken bir hata oluştu: {str(e)}"
         trace.append(f"❌ **Hata:** {str(e)}")
 
+    # UI vurgusu: yapısal hedefler varsa onları, yoksa ısı-zirvesini göster.
+    selected = sorted(structural_roots) if structural_roots else sorted(heatmap_top)
+
     return {
         "answer": answer,
-        "selected_node_ids": sorted(targets),
-        "execution_policy": "Semantik Fallback" if fallback_triggered else "Recursive Descent",
+        "selected_node_ids": selected,
+        "execution_policy": "Recursive Descent" if descent_ok else "Isı-Kapsamlı Fallback",
         "fallback_triggered": fallback_triggered,
         "context_tokens": current_token_count,
         "heatmap_scores": heatmap_scores,
