@@ -28,6 +28,17 @@ class TestDescentHelpers(unittest.TestCase):
         self.assertIn(10, ids)
 
 
+class TestAggregateHeatmap(unittest.TestCase):
+    def test_propagates_to_ancestors(self):
+        children = {None: [{"id": 1}], 1: [{"id": 2}, {"id": 3}], 3: [{"id": 4}]}
+        heat = {4: 0.9, 2: 0.3}
+        agg = main._aggregate_heatmap(heat, children)
+        self.assertAlmostEqual(agg[4], 0.9)
+        self.assertAlmostEqual(agg[3], 0.9)   # çocuğu 4'ten miras
+        self.assertAlmostEqual(agg[2], 0.3)
+        self.assertAlmostEqual(agg[1], 0.9)   # alt-ağacın en yükseği
+
+
 class TestRecursiveDescent(unittest.TestCase):
     def setUp(self):
         # 1(iç)->[2(yaprak),3(iç)->[4(yaprak)]], 5(yaprak)

@@ -337,6 +337,30 @@ def _valid_ids(raw_list, present_ids):
     return out
 
 
+def _aggregate_heatmap(heatmap, children_map):
+    """
+    Her düğüme alt-ağacındaki EN YÜKSEK ısı skorunu yayar (ancestor aggregation).
+    İç düğüm başlıklarının içeriği/özeti çoğu zaman bilgisizdir; bu yayılım sayesinde
+    descent kök seviyede "ilgili içerik bu dalın altında" sinyalini görebilir
+    (örn. "LVEF" kök başlıklarda geçmese de Proje 1 alt-ağacında eşleştiği için parlar).
+    """
+    agg = {}
+
+    def visit(nid):
+        if nid in agg:
+            return agg[nid]
+        best = heatmap.get(nid, heatmap.get(str(nid), 0)) or 0
+        agg[nid] = best  # döngü koruması (ağaçta yok ama güvenli)
+        for ch in children_map.get(nid, []):
+            best = max(best, visit(ch["id"]))
+        agg[nid] = best
+        return best
+
+    for root in children_map.get(None, []):
+        visit(root["id"])
+    return agg
+
+
 def run_recursive_descent(document_id, query, children_map, node_map, heatmap, model_name, trace):
     """
     Ağaçta seviye seviye inerek soruyla ilgili hedef düğümleri toplar.
@@ -435,8 +459,10 @@ def query_aegis(payload: QueryRequest):
     # ==========================================
     # 2. Recursive Descent (seviye seviye iniş)
     # ==========================================
+    # Descent için ısıyı atalara yay (iç düğüm başlıkları opak olduğundan kritik).
+    descent_heatmap = _aggregate_heatmap(heatmap_scores, children_map)
     targets, confidence, descended = run_recursive_descent(
-        document_id, query, children_map, node_map, heatmap_scores, model_name, trace
+        document_id, query, children_map, node_map, descent_heatmap, model_name, trace
     )
     fallback_triggered = (not targets) or confidence == "LOW"
     if fallback_triggered:
