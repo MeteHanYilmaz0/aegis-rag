@@ -189,6 +189,40 @@ class DBManager:
                 pass
         return self._extractive_summary(content, heading)
 
+    def _chunk_text(self, content: str) -> List[str]:
+        """
+        İçeriği cümle-duyarlı, örtüşmeli (overlap) sabit-boy chunk'lara böler.
+
+        Ham `\\n\\n` bölme, PDF satır-kırılmasında her fiziksel satırı (~90 karakter) ayrı
+        chunk yapıp cümleleri/bilgileri parçalıyordu (kesin bilgi retrieve edilemiyordu).
+        Burada metin önce REFLOW edilir (satır-sonu tirelemesi birleştirilir, boşluklar
+        normalize edilir), cümlelere ayrılır ve ~CHUNK_SIZE_CHARS boyutunda, sondan
+        ~CHUNK_OVERLAP_CHARS örtüşmeli chunk'lara paketlenir.
+        """
+        if not content or not content.strip():
+            return []
+        # Satır-sonu tirelemesi: "Tür-\nkiye" -> "Türkiye" (gerçek tireler -proxy-risk- korunur)
+        text = re.sub(r"-\s*\n\s*", "", content)
+        # Kalan satır kırılmalarını boşluğa çevir, çoklu boşlukları sadeleştir
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return []
+
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        size, overlap = config.CHUNK_SIZE_CHARS, config.CHUNK_OVERLAP_CHARS
+        chunks: List[str] = []
+        cur = ""
+        for s in sentences:
+            if cur and len(cur) + len(s) + 1 > size:
+                chunks.append(cur.strip())
+                tail = cur[-overlap:].strip()  # bağlam sürekliliği için örtüşme
+                cur = f"{tail} {s}".strip()
+            else:
+                cur = f"{cur} {s}".strip() if cur else s
+        if cur.strip():
+            chunks.append(cur.strip())
+        return chunks
+
     def add_document(self, filename: str, file_path: str, toc_nodes: List[Dict[str, Any]], progress_callback=None) -> int:
         """Yazma işlemini kilitle (tek paylaşılan SQLite bağlantısı çok thread'de güvenli olsun)."""
         with self._write_lock:
@@ -250,7 +284,7 @@ class DBManager:
         for node in toc_nodes:
             content = (node.get("content") or "").strip()
             if content:
-                paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+                paragraphs = self._chunk_text(content)
                 for p_idx, para in enumerate(paragraphs):
                     chroma_ids.append(f"doc_{document_id}_node_{node['id']}_p_{p_idx}")
                     chroma_documents.append(para)

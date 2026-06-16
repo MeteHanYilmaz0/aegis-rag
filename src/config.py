@@ -40,6 +40,12 @@ RERANK_LEXICAL_WEIGHT = 0.4
 TOKEN_BUDGET = 4000
 TOKEN_PER_WORD = 1.35      # Türkçe yaklaşık token/kelime oranı
 
+# --- Chunking (embedding birimleri) ---
+# PDF satır-kırılması ham metni ~90 karakterlik parçalara böler ve cümleleri/bilgileri
+# parçalar (kesin bilgi retrieve edilemez). Cümle-duyarlı + örtüşmeli sabit-boy chunk.
+CHUNK_SIZE_CHARS = 700
+CHUNK_OVERLAP_CHARS = 150
+
 # --- Ağaç navigasyonu (Faz 2-3'te kullanılacak) ---
 MAX_TREE_DEPTH = 6
 MAX_LEAVES = 3
