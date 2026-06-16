@@ -409,6 +409,18 @@ def run_recursive_descent(document_id, query, children_map, node_map, heatmap, m
     return targets, confidence, descended
 
 
+_ABSTRACT_HEADINGS = {"özet", "abstract", "ozet", "öz", "summary"}
+
+
+def _abstract_node_ids(nodes):
+    """
+    ÖZET/ABSTRACT düğümlerinin id'leri. Bunlar belgenin en bilgi-yoğun bölümleridir;
+    factual sorularda kesin bilgi (veri kaynakları, sınırlılıklar vb.) genelde buradadır.
+    Her sorgunun kapsamına eklenir — rerank alakasızsa zaten elemekte, riski düşük.
+    """
+    return {n["id"] for n in nodes if (n.get("heading") or "").strip().lower() in _ABSTRACT_HEADINGS}
+
+
 def _subtree_ids(root_ids, children_map):
     """Verilen düğümler + tüm alt-ağaç (descendant) node_id kümesi (scoped arama kapsamı)."""
     out = set()
@@ -481,8 +493,9 @@ def query_aegis(payload: QueryRequest):
     # Descent yanlış dala inse bile (örn. tez Q3: descent ch5'e indi ama içerik ch3'te,
     # ısı ch3'ü işaret etti) vektör sinyali telafi eder.
     heatmap_top = [nid for nid, _ in sorted(heatmap_scores.items(), key=lambda kv: kv[1], reverse=True)[:3]]
+    abstract_ids = _abstract_node_ids(nodes)  # ÖZET/ABSTRACT'ı her zaman kapsama kat
     structural_roots = set(targets) | set(descended)
-    scope_roots = structural_roots | set(heatmap_top)
+    scope_roots = structural_roots | set(heatmap_top) | abstract_ids
 
     if scope_roots:
         # 3a. Özetler: önce yapısal hedefler (en sığ = bölüm başlıkları), sonra ısı-zirvesi.
@@ -502,7 +515,7 @@ def query_aegis(payload: QueryRequest):
         # 3b. Kapsam-içi scoped pasaj araması (yapısal + ısı-zirvesi alt-ağaçları İÇİNDE)
         scope = list(_subtree_ids(scope_roots, children_map))
         scoped = db_manager.query_chroma(document_id, query, top_k=config.SCOPED_TOP_K, node_ids=scope)
-        scoped = lexical_semantic_rerank(query, scoped, top_k=config.RERANK_TOP_K)
+        scoped = lexical_semantic_rerank(query, scoped, top_k=config.CONTEXT_PASSAGES)
         for res in scoped:
             meta = res["metadata"]
             page = meta.get("start_page")
@@ -514,7 +527,7 @@ def query_aegis(payload: QueryRequest):
                 current_token_count += t
             else:
                 break
-        trace.append(f"🔎 **Kapsam-içi arama:** {len(scope)} düğüm (yapısal {sorted(structural_roots) or '-'} + ısı {heatmap_top}) → {len(scoped)} pasaj.")
+        trace.append(f"🔎 **Kapsam-içi arama:** {len(scope)} düğüm (yapısal {sorted(structural_roots) or '-'} + ısı {heatmap_top} + özet {sorted(abstract_ids) or '-'}) → {len(scoped)} pasaj bağlama alındı.")
 
     # 3c. Tam global fallback: ne yapısal hedef ne ısı sinyali varsa
     if not context_blocks:

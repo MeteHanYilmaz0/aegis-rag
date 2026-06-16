@@ -30,8 +30,9 @@ LLM_THINKING = False
 # --- ChromaDB / Retrieval ---
 CHROMA_COLLECTION = "aegis_rag_chunks"
 SEMANTIC_TOP_K = 10        # ChromaDB ham aday sayısı (global heatmap)
-SCOPED_TOP_K = 20          # yaprak-içi/kapsam-içi arama ham aday (büyük yapraklarda recall)
-RERANK_TOP_K = 5           # rerank sonrası tutulan aday
+SCOPED_TOP_K = 30          # yaprak-içi/kapsam-içi arama ham aday (büyük yapraklarda recall)
+RERANK_TOP_K = 5           # heatmap için tutulan düğüm sayısı
+CONTEXT_PASSAGES = 12      # sentezе beslenen pasaj sayısı (boş bütçeyi kullan — recall ↑)
 RERANK_COSINE_WEIGHT = 0.6
 RERANK_LEXICAL_WEIGHT = 0.4
 
