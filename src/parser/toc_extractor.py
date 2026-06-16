@@ -265,9 +265,20 @@ class TOCExtractor:
                     bold_chars = sum(len(s["text"]) for s in spans if (s.get("flags", 0) & 2))
                     bold_ratio = bold_chars / total_chars
 
+                    # İÇİNDEKİLER (TOC) sayfasındaki noktalı-lider satırları başlık değil,
+                    # gürültüdür (örn. "3.7 Kural Tabanlı Risk Motoru ........ 23"). Tamamen atla.
+                    if re.search(r"\.{4,}\s*\d+\s*$", line_text):
+                        continue
+
                     word_count = len(line_text.split())
                     ends_sentence = line_text[-1] in ".!?,:;"
-                    numbering = re.match(r"^\d+(\.\d+){0,4}\.?\s+[^\d\s]", line_text)
+                    # Güvenilir YAPISAL numaralandırma: çok-seviyeli alt-bölüm (3.7, 2.1.4) veya
+                    # bölüm başlığı (1 GİRİŞ). Tek-seviyeli "1." LİSTE ögesidir, başlık DEĞİL
+                    # (tezlerde amaç/bulgu listeleri böyle; numaralandırma tek başına başlık yapmaz).
+                    # İlk bölüm 1-999 olmalı (ondalık değer değil): "3.7" evet, "0.993"/"2.024" hayır.
+                    multi_num = re.match(r"^[1-9]\d{0,2}\.\d+(\.\d+){0,3}\.?\s+\S", line_text)
+                    chapter_num = re.match(r"^\d+\s+[A-ZÇĞİÖŞÜ]", line_text)
+                    structural_num = multi_num or chapter_num
 
                     is_short = word_count <= 18 and len(line_text) <= 140
                     big = max_size > body_font_size + 1.5                       # global (kitap)
@@ -275,16 +286,16 @@ class TOCExtractor:
                     # Sayfa-içi göreceli: satır, o sayfanın gövde fontundan belirgin büyük mü?
                     size_ratio = max_size / page_body_size if page_body_size else 1.0
                     page_relative = size_ratio >= 1.18
-                    is_heading = is_short and not ends_sentence and (big or bold_big or page_relative or bool(numbering))
+                    is_heading = is_short and not ends_sentence and (big or bold_big or page_relative or bool(structural_num))
 
                     if is_heading:
                         if body_parts:
                             markdown_lines.append("\n" + " ".join(body_parts).strip() + "\n")
                             body_parts = []
-                        level = TOCExtractor._heading_level(max_size, body_font_size, line_text, numbering)
+                        level = TOCExtractor._heading_level(max_size, body_font_size, line_text, structural_num)
                         # Sadece sayfa-göreceli sinyalle yakalanan (slayt) başlıklarda mutlak
                         # fark küçük olabilir; seviyeyi orana göre de değerlendir, daha belirgini al.
-                        if not numbering:
+                        if not structural_num:
                             if size_ratio >= 1.6:
                                 level = min(level, 1)
                             elif size_ratio >= 1.4:
