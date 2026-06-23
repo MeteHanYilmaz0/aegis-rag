@@ -3,6 +3,7 @@ import requests
 import os
 import json
 import time
+import codecs
 
 # Sayfa Yapılandırması
 st.set_page_config(
@@ -476,38 +477,61 @@ with main_col_right:
         if user_query:
             st.session_state.messages.append({"role": "user", "content": user_query})
             st.markdown(f'<div class="chat-bubble-user">👤 <strong>Siz:</strong><br>{user_query}</div>', unsafe_allow_html=True)
-            
-            with st.spinner("Aegis RAG akıl yürütüyor, bütçelendirme yapıyor..."):
-                try:
-                    payload = {
-                        "document_id": selected_doc_id,
-                        "query": user_query,
-                        "model_name": selected_model
-                    }
-                    
-                    response = requests.post(f"{BACKEND_URL}/api/query", json=payload, timeout=120)
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        bot_answer = result.get("answer", "Cevap üretilemedi.")
-                        bot_trace = result.get("trace", [])
-                        
-                        # Isı haritası ve Seçilen Düğümleri kaydet
-                        st.session_state.active_heatmap = result.get("heatmap_scores", {})
-                        st.session_state.selected_nodes = result.get("selected_node_ids", [])
-                        
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": bot_answer,
-                            "execution_policy": result.get("execution_policy", "Hierarchical"),
-                            "context_tokens": result.get("context_tokens", 0),
-                            "fallback_triggered": result.get("fallback_triggered", False),
-                            "trace": bot_trace
-                        })
-                        st.rerun()
+
+            payload = {"document_id": selected_doc_id, "query": user_query, "model_name": selected_model}
+            meta_box = {"meta": None}
+
+            def stream_answer():
+                """Streaming: gövdenin ilk satırı JSON meta, sonrası cevap metni (token token)."""
+                resp = requests.post(f"{BACKEND_URL}/api/query/stream", json=payload, stream=True, timeout=180)
+                resp.raise_for_status()
+                dec = codecs.getincrementaldecoder("utf-8")()
+                buf, meta_done = "", False
+                for raw in resp.iter_content(chunk_size=48):
+                    if not raw:
+                        continue
+                    text = dec.decode(raw)
+                    if not text:
+                        continue
+                    if not meta_done:
+                        buf += text
+                        if "\n" in buf:
+                            line, rest = buf.split("\n", 1)
+                            meta_box["meta"] = json.loads(line)
+                            meta_done = True
+                            if rest:
+                                yield rest
                     else:
-                        st.error("Sorgulama hatası.")
+                        yield text
+
+            bot_answer, meta = None, None
+            st.markdown('<div class="chat-bubble-bot">🤖 <strong>Aegis RAG</strong> akıl yürütüyor…</div>', unsafe_allow_html=True)
+            try:
+                bot_answer = st.write_stream(stream_answer)
+                meta = meta_box["meta"] or {}
+            except Exception:
+                # Streaming başarısızsa tam-yanıt (JSON) endpoint'ine düş
+                try:
+                    with st.spinner("Aegis RAG akıl yürütüyor…"):
+                        r = requests.post(f"{BACKEND_URL}/api/query", json=payload, timeout=180)
+                        r.raise_for_status()
+                        meta = r.json()
+                        bot_answer = meta.get("answer", "Cevap üretilemedi.")
                 except Exception as e:
                     st.error(f"Bağlantı hatası: {str(e)}")
+
+            if bot_answer is not None:
+                meta = meta or {}
+                st.session_state.active_heatmap = meta.get("heatmap_scores", {})
+                st.session_state.selected_nodes = meta.get("selected_node_ids", [])
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": bot_answer,
+                    "execution_policy": meta.get("execution_policy", "Recursive Descent"),
+                    "context_tokens": meta.get("context_tokens", 0),
+                    "fallback_triggered": meta.get("fallback_triggered", False),
+                    "trace": meta.get("trace", []),
+                })
+                st.rerun()
     else:
         st.warning("⚠️ Sohbet edebilmek için lütfen önce sol menüden bir doküman yükleyin veya aktif bir doküman seçin.")

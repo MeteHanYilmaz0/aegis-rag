@@ -7,6 +7,7 @@ import requests
 import uuid
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 
@@ -445,16 +446,12 @@ def _subtree_ids(root_ids, children_map):
     return out
 
 
-@app.post("/api/query")
-def query_aegis(payload: QueryRequest):
-    """Hiyerarşik recursive descent + yaprak-içi scoped retrieval + alıntılı sentez."""
-    document_id = payload.document_id
-    query = payload.query
-    model_name = payload.model_name
-
-    if not check_ollama_status():
-        raise HTTPException(status_code=503, detail="Yerel Ollama servisine bağlanılamadı.")
-
+def _build_query_context(document_id: int, query: str, model_name: str):
+    """
+    Retrieval + recursive descent + bağlam kurulumu; sentez prompt'unu ve meta'yı döndürür.
+    JSON (/api/query) ve streaming (/api/query/stream) endpoint'leri paylaşır.
+    Döner: (qa_prompt, meta).
+    """
     nodes = db_manager.get_document_nodes(document_id)
     if not nodes:
         raise HTTPException(status_code=404, detail="Dokümana ait TOC ağacı bulunamadı.")
@@ -586,19 +583,9 @@ KURALLAR:
 3. Atıf yaptığın yeri parantez içinde belirt (bölüm yolu ve varsa sayfa).
 4. Doğrudan cevabı yaz; "bağlama göre", "yönergelere göre" gibi meta-ifadeleri kullanma.
 """
-    answer = "Cevap oluşturulamadı."
-    try:
-        candidate = ollama_generate(model_name, qa_prompt).strip()
-        answer = candidate if candidate else "Model boş yanıt döndürdü."
-    except Exception as e:
-        answer = f"Sorgu işlenirken bir hata oluştu: {str(e)}"
-        trace.append(f"❌ **Hata:** {str(e)}")
-
     # UI vurgusu: yapısal hedefler varsa onları, yoksa ısı-zirvesini göster.
     selected = sorted(structural_roots) if structural_roots else sorted(heatmap_top)
-
-    return {
-        "answer": answer,
+    meta = {
         "selected_node_ids": selected,
         "execution_policy": "Recursive Descent" if descent_ok else "Isı-Kapsamlı Fallback",
         "fallback_triggered": fallback_triggered,
@@ -606,3 +593,53 @@ KURALLAR:
         "heatmap_scores": heatmap_scores,
         "trace": trace,
     }
+    return qa_prompt, meta
+
+
+@app.post("/api/query")
+def query_aegis(payload: QueryRequest):
+    """Tam yanıt (JSON): boru hattı + tek seferde sentez."""
+    if not check_ollama_status():
+        raise HTTPException(status_code=503, detail="Yerel Ollama servisine bağlanılamadı.")
+    qa_prompt, meta = _build_query_context(payload.document_id, payload.query, payload.model_name)
+    try:
+        candidate = ollama_generate(payload.model_name, qa_prompt).strip()
+        answer = candidate if candidate else "Model boş yanıt döndürdü."
+    except Exception as e:
+        answer = f"Sorgu işlenirken bir hata oluştu: {str(e)}"
+        meta["trace"].append(f"❌ **Hata:** {str(e)}")
+    return {"answer": answer, **meta}
+
+
+@app.post("/api/query/stream")
+def query_aegis_stream(payload: QueryRequest):
+    """
+    Aynı boru hattı; sentez token-token akıtılır (algılanan hız ↑).
+    Gövde: İLK satır = JSON meta (trace/heatmap/selected...), sonrası = cevap metni.
+    """
+    if not check_ollama_status():
+        raise HTTPException(status_code=503, detail="Yerel Ollama servisine bağlanılamadı.")
+    qa_prompt, meta = _build_query_context(payload.document_id, payload.query, payload.model_name)
+
+    def generate():
+        yield json.dumps(meta, ensure_ascii=False) + "\n"
+        try:
+            with requests.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={"model": payload.model_name, "prompt": qa_prompt, "stream": True,
+                      "think": config.LLM_THINKING, "keep_alive": config.OLLAMA_KEEP_ALIVE},
+                stream=True, timeout=config.OLLAMA_GENERATE_TIMEOUT,
+            ) as r:
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        piece = json.loads(line).get("response", "")
+                    except Exception:
+                        continue
+                    if piece:
+                        yield piece
+        except Exception as e:
+            yield f"\n[Sentez hatası: {str(e)}]"
+
+    return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")

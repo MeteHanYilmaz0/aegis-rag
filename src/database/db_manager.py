@@ -3,6 +3,7 @@ import os
 import re
 import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 import chromadb
 
@@ -241,11 +242,27 @@ class DBManager:
         )
         document_id = cursor.lastrowid
 
+        # Özetleri ÖNCE paralel üret (her biri bir LLM çağrısı olabilir; sıralı üretim
+        # büyük belgelerde indekslemeyi yavaşlatıyordu). Bounded thread havuzu.
+        summaries = {}
+        if toc_nodes:
+            with ThreadPoolExecutor(max_workers=config.SUMMARY_WORKERS) as pool:
+                future_map = {
+                    pool.submit(self._make_summary, (n.get("content") or "").strip(), n["heading"]): n["id"]
+                    for n in toc_nodes
+                }
+                for fut in as_completed(future_map):
+                    nid = future_map[fut]
+                    try:
+                        summaries[nid] = fut.result()
+                    except Exception:
+                        summaries[nid] = ""
+
         # SQLite'a TOC düğümlerini ekle (özet + yaprak/sayfa metadatası ile)
         for node in toc_nodes:
             content = (node.get("content") or "").strip()
             heading = node["heading"]
-            summary = self._make_summary(content, heading)
+            summary = summaries.get(node["id"]) or self._extractive_summary(content, heading)
             token_count = int(len(content.split()) * config.TOKEN_PER_WORD) if content else 0
 
             cursor.execute(
