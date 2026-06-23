@@ -39,6 +39,16 @@ class TestAggregateHeatmap(unittest.TestCase):
         self.assertAlmostEqual(agg[1], 0.9)   # alt-ağacın en yükseği
 
 
+class TestShouldRunDescent(unittest.TestCase):
+    def test_flat_small_tree_skips(self):
+        nodes = [{"id": i} for i in range(10)]  # 10 < eşik (25)
+        self.assertFalse(main._should_run_descent(nodes))
+
+    def test_rich_tree_runs(self):
+        nodes = [{"id": i} for i in range(40)]  # 40 >= eşik
+        self.assertTrue(main._should_run_descent(nodes))
+
+
 class TestRecursiveDescent(unittest.TestCase):
     def setUp(self):
         # 1(iç)->[2(yaprak),3(iç)->[4(yaprak)]], 5(yaprak)

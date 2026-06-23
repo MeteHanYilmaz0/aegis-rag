@@ -422,6 +422,15 @@ def _abstract_node_ids(nodes):
     return {n["id"] for n in nodes if (n.get("heading") or "").strip().lower() in _ABSTRACT_HEADINGS}
 
 
+def _should_run_descent(nodes):
+    """
+    Recursive descent ancak yeterince zengin/derin ağaçta değer katar. Düz/küçük ağaçta
+    (örn. bölüm-yaprağı tezler) descent çoğunlukla LOW→fallback verdiğinden, ısı-kapsamlı
+    arama zaten yeterli olur ve descent'in LLM çağrısı boşa gider. Eşik altı → atla.
+    """
+    return len(nodes) >= config.DESCENT_MIN_NODES
+
+
 def _subtree_ids(root_ids, children_map):
     """Verilen düğümler + tüm alt-ağaç (descendant) node_id kümesi (scoped arama kapsamı)."""
     out = set()
@@ -475,16 +484,22 @@ def query_aegis(payload: QueryRequest):
     # ==========================================
     # 2. Recursive Descent (seviye seviye iniş)
     # ==========================================
-    # Descent için ısıyı atalara yay (iç düğüm başlıkları opak olduğundan kritik).
-    descent_heatmap = _aggregate_heatmap(heatmap_scores, children_map)
-    targets, confidence, descended = run_recursive_descent(
-        document_id, query, children_map, node_map, descent_heatmap, model_name, trace
-    )
-    descent_ok = bool(targets) and confidence != "LOW"
-    if descent_ok:
-        trace.append(f"🎯 **Descent tamamlandı:** hedef düğümler {sorted(targets)} (güven: {confidence}).")
+    # Hız (model-agnostik): descent ancak yeterince zengin ağaçta değer katar. Düz/küçük
+    # ağaçta (örn. bölüm-yaprağı tezler) descent çoğunlukla LOW→fallback verir = boşa bir
+    # LLM çağrısı. Bu durumda descent atlanıp doğrudan ısı-kapsamlı aramaya geçilir.
+    if _should_run_descent(nodes):
+        descent_heatmap = _aggregate_heatmap(heatmap_scores, children_map)  # ısıyı atalara yay
+        targets, confidence, descended = run_recursive_descent(
+            document_id, query, children_map, node_map, descent_heatmap, model_name, trace
+        )
+        descent_ok = bool(targets) and confidence != "LOW"
+        if descent_ok:
+            trace.append(f"🎯 **Descent tamamlandı:** hedef düğümler {sorted(targets)} (güven: {confidence}).")
+        else:
+            trace.append("⚠️ **Descent zayıf/sonuçsuz → ısı haritası kapsamına geçiliyor.**")
     else:
-        trace.append("⚠️ **Descent zayıf/sonuçsuz → ısı haritası kapsamına geçiliyor.**")
+        targets, confidence, descended, descent_ok = set(), "SKIP", set(), False
+        trace.append(f"⏭️ **Düz/küçük ağaç ({len(nodes)} düğüm):** descent atlandı → doğrudan ısı-kapsamlı arama (hız).")
 
     # ==========================================
     # 3. Bağlam: özetler + kapsam-içi pasajlar (Context Economy)

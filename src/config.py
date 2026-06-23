@@ -46,10 +46,13 @@ TOKEN_PER_WORD = 1.35      # Türkçe yaklaşık token/kelime oranı
 CHUNK_SIZE_CHARS = 700
 CHUNK_OVERLAP_CHARS = 150
 
-# --- Ağaç navigasyonu (Faz 2-3'te kullanılacak) ---
+# --- Ağaç navigasyonu ---
 MAX_TREE_DEPTH = 6
 MAX_LEAVES = 3
 MAX_DESCENT_CALLS = 8
+# Düz/küçük ağaçta (bu eşiğin altında düğüm) recursive descent atlanır; doğrudan
+# ısı-kapsamlı aramaya geçilir (boşa LLM çağrısını önler — model-agnostik hız).
+DESCENT_MIN_NODES = 25
 
 # --- Zaman aşımları (saniye) ---
 OLLAMA_HEALTH_TIMEOUT = 2.5
