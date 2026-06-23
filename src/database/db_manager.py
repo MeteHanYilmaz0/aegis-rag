@@ -81,21 +81,21 @@ class DBManager:
         """
         Cosine mesafe uzaylı koleksiyonu döndürür.
 
-        ÖNEMLİ: ChromaDB varsayılanı L2'dir; L2 ile `similarity = 1 - distance` formülü
-        yanlış sonuç verir (mesafe 1'i aşar, benzerlik negatife/0'a kırpılır). Doğru
-        kosinüs benzerliği için koleksiyon `hnsw:space=cosine` ile oluşturulmalıdır.
-        Eski (L2) bir koleksiyon bulunursa, doğru benzerlik için yeniden oluşturulur —
-        bu durumda belgelerin yeniden indekslenmesi gerekir (dev verisi).
+        ÖNEMLİ:
+        - ChromaDB varsayılanı L2'dir; L2 ile `similarity = 1 - distance` yanlış sonuç verir.
+          Doğru kosinüs için koleksiyon `hnsw:space=cosine` ile oluşturulmalıdır.
+        - Embedding modeli değişince (örn. nomic 768d → bge-m3 1024d) vektör boyutu değişir;
+          eski koleksiyona eklemek boyut hatası verir. Bu yüzden koleksiyon metadata'sında
+          `embed_model` tutulur; uzay VEYA model uyuşmazsa koleksiyon yeniden oluşturulur.
+        Her iki durumda da belgelerin yeniden indekslenmesi gerekir (dev verisi).
         """
         name = config.CHROMA_COLLECTION
-        col = self.chroma_client.get_or_create_collection(
-            name=name, metadata={"hnsw:space": "cosine"}
-        )
-        if (col.metadata or {}).get("hnsw:space") != "cosine":
+        wanted = {"hnsw:space": "cosine", "embed_model": config.EMBED_MODEL}
+        col = self.chroma_client.get_or_create_collection(name=name, metadata=wanted)
+        meta = col.metadata or {}
+        if meta.get("hnsw:space") != "cosine" or meta.get("embed_model") != config.EMBED_MODEL:
             self.chroma_client.delete_collection(name)
-            col = self.chroma_client.get_or_create_collection(
-                name=name, metadata={"hnsw:space": "cosine"}
-            )
+            col = self.chroma_client.get_or_create_collection(name=name, metadata=wanted)
         return col
 
     def _init_sqlite(self):

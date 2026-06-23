@@ -18,7 +18,7 @@ pip install -r requirements.txt
 
 # Ön koşul: Ollama çalışıyor olmalı + gerekli modeller çekilmiş olmalı
 ollama pull qwen3:8b                  # LLM (navigasyon/routing/sentez) — varsayılan
-ollama pull nomic-embed-text         # embedding modeli (ChromaDB)
+ollama pull bge-m3                    # embedding modeli (ChromaDB) — çok dilli/Türkçe, varsayılan
 
 # Backend (port 8002 — README'deki 8000 GÜNCEL DEĞİL, kod 8002 kullanır)
 python -m uvicorn src.backend.main:app --reload --port 8002
@@ -46,7 +46,7 @@ Not: `benchmark_suite.py`'deki testlerin çoğu mock/sabit veriyle çalışır (
 Tek bir `DBManager` hem SQLite'ı hem ChromaDB'yi yönetir. **Her belge ikisine birden yazılır:**
 - **SQLite** (`db/aegis_rag.db`): `documents`, `toc_nodes` (hiyerarşik ağaç; her düğümde `summary`, `is_leaf`, `start_page`/`end_page`, `token_count`). Yapısal hattın kaynağı. Şema sürümü `SCHEMA_VERSION` (PRAGMA user_version); değişince tablolar düşürülür → yeniden indeksleme gerekir. WAL + `_write_lock` ile eşzamanlı yazma korunur. (`toc_links`/regex DAG **kaldırıldı**.)
 - **ChromaDB** (`db/chroma_db/`): **içerik taşıyan** düğümlerin içerikleri `\n\n` ile paragraflara bölünüp gömülür; metadata `node_id`/`path`/`heading`/`start_page` taşır. Embedding'ler `OllamaEmbedder` ile elle hesaplanıp Chroma'ya verilir (koleksiyonun kendi embedding fonksiyonu yok). **İki hat `node_id` üzerinden kesişir** (heatmap bu eşlemeyle çizilir; scoped arama `node_id ∈ {...}` ile yaprağa daraltılır).
-- `OllamaEmbedder` **fail-fast**'tir (Ollama yoksa hata fırlatır, sessiz fallback yok) ve nomic için `search_document:`/`search_query:` ön-eki uygular.
+- `OllamaEmbedder` **fail-fast**'tir (Ollama yoksa hata fırlatır, sessiz fallback yok). Varsayılan embedding **`bge-m3`** (çok dilli/Türkçe, 1024d, ön-ek istemez); nomic seçilirse `search_document:`/`search_query:` ön-eki uygular. Koleksiyon metadata'sında `embed_model` tutulur; model değişince (boyut farkı) koleksiyon otomatik yeniden oluşturulur → yeniden indeksleme gerekir.
 
 ### Parse katmanı (`src/parser/toc_extractor.py`)
 Üst giriş noktası `extract_tree(pdf_path)`: gömülü TOC/yer imini **yalnız güvenilirse** kullanır (`_bookmarks_usable`: ≥3 giriş VE en büyük bölüm belgenin ≤%25'i — slayt destelerindeki seyrek/yanlış-yerleşmiş yer imleri içerik kaymasına yol açtığından elenir), aksi halde sezgisel yola düşer (`convert_pdf_to_markdown` → `extract_toc_tree`). Başlık tespiti **satır seviyesinde** ve **slayt-duyarlıdır**: mutlak font eşiği (kitap) + **sayfa-içi göreceli oran** (`size/page_body ≥ 1.18`, slaytlarda gövde font globalde büyük olduğu için şart) + kalın + numaralandırma; kısa ve cümle noktalamasıyla bitmeyen satırlar. Tüm yollar `finalize_tree` ile sonlanır: **derinlik katlama** (`MAX_TREE_DEPTH`) + **`is_leaf`**. `.md/.txt` için `extract_toc_tree` + `finalize_tree` ayrı çağrılır.
