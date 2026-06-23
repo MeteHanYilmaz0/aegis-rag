@@ -63,6 +63,7 @@ def ollama_generate(model: str, prompt: str, temperature: Optional[float] = None
         "prompt": prompt,
         "stream": False,
         "think": config.LLM_THINKING,
+        "keep_alive": config.OLLAMA_KEEP_ALIVE,
     }
     if temperature is not None:
         payload["options"] = {"temperature": temperature}
@@ -458,7 +459,10 @@ def query_aegis(payload: QueryRequest):
     # ==========================================
     # 1. Heatmap (global çift-hat: ChromaDB + rerank) — UI + descent ipucu
     # ==========================================
-    semantic_raw = db_manager.query_chroma(document_id, query, top_k=config.SEMANTIC_TOP_K)
+    # Sorgu embedding'i bir kez hesaplanır; hem global heatmap hem scoped aramada paylaşılır.
+    query_embedding = db_manager.embedder.embed_query(query)
+    semantic_raw = db_manager.query_chroma(document_id, query, top_k=config.SEMANTIC_TOP_K,
+                                           query_embedding=query_embedding)
     reranked_hits = lexical_semantic_rerank(query, semantic_raw, top_k=config.RERANK_TOP_K)
     heatmap_scores = {}
     for hit in reranked_hits:
@@ -514,7 +518,8 @@ def query_aegis(payload: QueryRequest):
 
         # 3b. Kapsam-içi scoped pasaj araması (yapısal + ısı-zirvesi alt-ağaçları İÇİNDE)
         scope = list(_subtree_ids(scope_roots, children_map))
-        scoped = db_manager.query_chroma(document_id, query, top_k=config.SCOPED_TOP_K, node_ids=scope)
+        scoped = db_manager.query_chroma(document_id, query, top_k=config.SCOPED_TOP_K,
+                                         node_ids=scope, query_embedding=query_embedding)
         scoped = lexical_semantic_rerank(query, scoped, top_k=config.CONTEXT_PASSAGES)
         for res in scoped:
             meta = res["metadata"]

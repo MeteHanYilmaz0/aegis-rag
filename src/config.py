@@ -55,3 +55,7 @@ MAX_DESCENT_CALLS = 8
 OLLAMA_HEALTH_TIMEOUT = 2.5
 OLLAMA_GENERATE_TIMEOUT = 60
 EMBED_TIMEOUT = 30
+
+# Modelleri RAM'de sıcak tut (bge-m3 ↔ qwen3 takası/yeniden-yükleme thrashing'ini azaltır).
+# 16GB'da iki model birlikte sığmazsa Ollama yine takas eder; o durumda kısalt veya -1 dene.
+OLLAMA_KEEP_ALIVE = os.getenv("AEGIS_OLLAMA_KEEP_ALIVE", "30m")

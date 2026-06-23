@@ -42,7 +42,7 @@ class OllamaEmbedder:
     def _embed_one(self, text: str) -> List[float]:
         response = requests.post(
             f"{self.base_url}/api/embeddings",
-            json={"model": self.model, "prompt": text},
+            json={"model": self.model, "prompt": text, "keep_alive": config.OLLAMA_KEEP_ALIVE},
             timeout=config.EMBED_TIMEOUT,
         )
         if response.status_code != 200:
@@ -366,7 +366,8 @@ class DBManager:
 
     def query_chroma(self, document_id: int, query: str,
                      top_k: int = config.SEMANTIC_TOP_K,
-                     node_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+                     node_ids: Optional[List[int]] = None,
+                     query_embedding: Optional[List[float]] = None) -> List[Dict[str, Any]]:
         """
         ChromaDB üzerinde anlamsal arama yapar.
 
@@ -379,7 +380,10 @@ class DBManager:
         else:
             where = {"document_id": document_id}
 
-        query_embedding = self.embedder.embed_query(query)
+        # Aynı sorgu bir istekte hem global hem scoped aramada kullanılıyor; embedding'i
+        # dışarıdan verilirse yeniden hesaplama (bge-m3 çağrısını yarıya indirir).
+        if query_embedding is None:
+            query_embedding = self.embedder.embed_query(query)
         results = self.chroma_collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
