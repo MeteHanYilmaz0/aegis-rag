@@ -125,7 +125,7 @@ class TOCExtractor:
                     if getattr(res, "errors", None):
                         src.close()
                         return None  # parça kısmi başarısız → bütünlük bozulur, PyMuPDF'e düş
-                    md_parts.append(res.document.export_to_markdown())
+                    md_parts.append(TOCExtractor._docling_md_with_pages(res.document, page_offset=start))
                 except Exception:
                     src.close()
                     return None
@@ -148,6 +148,39 @@ class TOCExtractor:
         if len(nodes) <= 1:
             return None
         return nodes
+
+    @staticmethod
+    def _docling_md_with_pages(doc, page_offset: int = 0) -> str:
+        """
+        DoclingDocument → Markdown + `<!-- Page N -->` sayfa işaretleri.
+        `export_to_markdown` sayfa bilgisini kaybeder; burada `iterate_items` ile her ögenin
+        provenance sayfasını ekleriz (sayfa-düzeyli alıntı için). Başlık seviyesi sonra
+        numaradan yeniden atanır. API farklı/başarısızsa export_to_markdown'a düşülür.
+        `page_offset`: parçanın global başlangıç sayfası (0-tabanlı) — global sayfa = offset + page_no.
+        """
+        try:
+            lines = []
+            last_page = None
+            for item, _lvl in doc.iterate_items():
+                text = (getattr(item, "text", "") or "").strip()
+                if not text:
+                    continue
+                prov = getattr(item, "prov", None)
+                page = getattr(prov[0], "page_no", None) if prov else None
+                if page is not None and page != last_page:
+                    lines.append(f"\n<!-- Page {page_offset + page} -->\n")
+                    last_page = page
+                label = str(getattr(item, "label", "")).lower()
+                if any(k in label for k in ("header", "title", "section")):
+                    lines.append(f"\n## {text}\n")
+                else:
+                    lines.append(text)
+            md = "\n".join(lines)
+            if "##" in md:  # en az bir başlık yakalandıysa bu yolu kullan
+                return md
+        except Exception:
+            pass
+        return doc.export_to_markdown()
 
     @staticmethod
     def _renumber_markdown_headings(markdown: str) -> str:
@@ -553,6 +586,22 @@ class TOCExtractor:
         Not: İçerik taşıyan her düğüm (iç düğüm preamble'ı dahil) vektörlenebilir;
         `is_leaf` yalnızca navigasyonun daha derine inebileceğini belirtir.
         """
+        if not nodes:
+            return nodes
+
+        # 0. Gürültü filtresi: içindekiler/şekil-tablo listesi gibi salt-listeleme sayfaları
+        # içerik düğümü değildir (özellikle Docling bunları ayrı düğüm yapıyor). Çıkar.
+        # Türkçe İ→i̇ küçültme tuzağına düşmemek için ASCII-fold ile karşılaştır.
+        # (Orphan kalan çocuklar aşağıdaki parent-remap ile köke bağlanır — güvenli.)
+        import unicodedata
+
+        def _fold(s):
+            s = unicodedata.normalize("NFKD", s or "")
+            return "".join(c for c in s if not unicodedata.combining(c)).lower().strip()
+
+        noise = {"icindekiler", "sekiller listesi", "tablolar listesi",
+                 "sekil listesi", "tablo listesi"}
+        nodes = [n for n in nodes if _fold(n.get("heading")) not in noise]
         if not nodes:
             return nodes
 

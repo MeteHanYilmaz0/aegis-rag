@@ -7,3 +7,7 @@ python-multipart==0.0.9
 requests==2.31.0
 pydantic==2.6.4
 pandas==2.2.1
+
+# Opsiyonel (Faz 4 "iyi kat" parser — alt-bölüm çözünürlüğü). Ağırdır (torch).
+# Kurulmazsa sistem PyMuPDF sezgisel parser'a düşer (fail-safe).
+#   pip install docling

@@ -83,6 +83,20 @@ class TestFinalizeTree(unittest.TestCase):
         # Katlama sonrası L3 yaprak olmalı (artık çocuğu yok)
         self.assertEqual(l3["is_leaf"], 1)
 
+    def test_listing_pages_filtered(self):
+        # İÇİNDEKİLER / ŞEKİLLER LİSTESİ salt-listeleme sayfaları çıkarılmalı
+        # (Türkçe İ→i̇ küçültme tuzağına rağmen — ASCII fold ile).
+        nodes = [
+            {"id": 1, "heading": "İÇİNDEKİLER", "level": 1, "parent_id": None, "path": "İÇİNDEKİLER", "content": "..."},
+            {"id": 2, "heading": "ŞEKİLLER LİSTESİ", "level": 1, "parent_id": None, "path": "x", "content": "..."},
+            {"id": 3, "heading": "1 GİRİŞ", "level": 1, "parent_id": None, "path": "1 GİRİŞ", "content": "metin"},
+        ]
+        final = TOCExtractor.finalize_tree(nodes, max_depth=6)
+        headings = [n["heading"] for n in final]
+        self.assertNotIn("İÇİNDEKİLER", headings)
+        self.assertNotIn("ŞEKİLLER LİSTESİ", headings)
+        self.assertIn("1 GİRİŞ", headings)
+
 
 class TestDoclingFailSafe(unittest.TestCase):
     def test_try_docling_returns_none_gracefully(self):

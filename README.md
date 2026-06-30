@@ -40,6 +40,8 @@ ollama pull qwen3:8b        # LLM (navigasyon + sentez)
 ollama pull bge-m3          # embedding (çok dilli/Türkçe)
 ```
 
+**Opsiyonel — daha iyi alt-bölüm çözünürlüğü (Faz 4):** `pip install docling`. Layout-model tabanlı parser, gövde alt-başlıklarını (3.7 vb.) ayrı düğüm yapar. Ağırdır; kurulmazsa sistem PyMuPDF'e düşer (fail-safe).
+
 ### 3. Başlatma (port 8002)
 ```bash
 # Backend
