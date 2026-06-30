@@ -234,3 +234,40 @@ TOKEN_BUDGET    = 4000
 ```
 
 **Migration:** `db/` gitignore'da ve dev verisi → şema değişince eski db silinip yeniden indekslenir (`db/aegis_rag.db` + `db/chroma_db/` sil), veya `SCHEMA_VERSION` sabiti uyuşmazsa tablolar otomatik yeniden kurulur.
+
+---
+
+## 🧱 7. Faz 4 Planı: Katmanlı Parser (Docling) — Alt-Bölüm Çözünürlüğü
+
+> **Durum:** Planlandı (2026-06-16). Faz 1-3 + cila (bge-m3, streaming, golden-set) bitti; bu son büyük yapısal kalem.
+
+### 7.1. Problem (kanıtlanmış)
+Mevcut sezgisel parser, **Word otomatik numaralandırması metin katmanında olmadığında** gövde alt-başlıklarını (3.7 "Kural Tabanlı Risk Motoru" vb.) yakalayamıyor → bölümler **büyük yapraklar** oluyor (tez: 7 bölüm, her biri 8-9 sayfa tek düğüm). Sonuç: routing kaba (descent yalnız bölüm seçebiliyor, alt-bölüme inemiyor) + scoped arama büyük kapsamda. bge-m3 + chunking bunu büyük ölçüde telafi etti ama **yapısal çözüm değil**.
+
+### 7.2. Çözüm: Docling (IBM) "iyi kat"
+Docling, **layout-model tabanlı** belge dönüştürücüdür; başlık stillerini/seviyelerini, tabloları, listeleri **yapısal olarak** ve güvenilir algılar (font-heuristic'e bağlı kalmaz). Word→PDF'te kaybolan numaralandırmayı görsel düzenle telafi eder → alt-bölümler ayrı düğüm olur.
+
+### 7.3. Tasarım — pluggable parser (katmanlı)
+`config.PARSER` ile seçilir; `extract_tree` parser-agnostik olur:
+- **`auto` (varsayılan):** gömülü TOC güvenilirse (`_bookmarks_usable`) onu kullan → değilse Docling kuruluysa Docling → değilse PyMuPDF sezgisel.
+- **`pymupdf`:** hızlı kat (mevcut), bağımlılık yok.
+- **`docling`:** iyi kat (opsiyonel `docling` pip paketi; torch + layout model indirir).
+- **`chandra`:** en iyi kat (opsiyonel; taranmış/el-yazısı/karmaşık tablo) — Faz 4c.
+
+Tüm yollar yine `finalize_tree`'ye (depth fold + is_leaf + sayfa) bağlanır → veri modeli **değişmez**.
+
+### 7.4. Alt adımlar
+- **4a — Pluggable arayüz:** `extract_tree(pdf_path, parser=config.PARSER)`; PyMuPDF varsayılan, davranış birebir korunur (saf refactor + testler).
+- **4b — Docling adaptörü:** `src/parser/docling_parser.py`; Docling çıktısını (heading level + içerik + sayfa) `finalize_tree` formatına çevirir. `auto` seçimi + **fail-safe**: Docling yok/başarısızsa PyMuPDF'e düş. Tez üzerinde doğrula (17 → ~50+ düğüm; 3.x alt-bölümleri ayrı; routing keskinleşir).
+- **4c (opsiyonel) — Chandra adaptörü:** quantized local veya Datalab API.
+
+### 7.5. Kısıtlar / kararlar
+- Docling **ağır** (torch). **Opsiyonel bağımlılık** — requirements'a koyma; kullanıcı isteyince kurar, yoksa sistem PyMuPDF ile çalışmaya devam eder ("16GB'da çalışır" vaadi korunur).
+- Docling parse offline/indeksleme aşamasında; qwen3/bge-m3 ile aynı anda gerekmez (16GB uyumu).
+- Docling başlık-seviyesi her belgede kusursuz değil → `finalize_tree` derinlik katlama yine güvenlik ağı.
+- Tablolar: Docling tablo-duyarlı → ileride tablo-aware chunk imkânı.
+
+### 7.6. Açık sorular
+- Docling vs Marker (ikisi de güçlü; Docling yapısal hiyerarşiyi daha doğrudan verir → öncelik Docling).
+- Docling parse hızının CPU'da kabul edilebilirliği (offline olduğundan tolere edilebilir).
+- Kullanıcının biriken "diğer önerileri" bu faza dahil edilecek.
