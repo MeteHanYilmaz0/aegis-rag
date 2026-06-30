@@ -34,9 +34,9 @@ run_aegis.bat
 ```powershell
 python -m unittest tests.test_parser            # tüm parser testleri
 python -m unittest tests.test_parser.TestTOCExtractor.test_extract_toc_tree_count   # tek test
-python tests/benchmark_suite.py                 # benchmark koşar, aegis_benchmark_report.md üretir
+python tests/benchmark_suite.py                 # golden-set değerlendirme (CANLI backend gerekir)
 ```
-Not: `benchmark_suite.py`'deki testlerin çoğu mock/sabit veriyle çalışır (gerçek retrieval doğruluğunu ölçmez); rapor metni pazarlama dilindedir.
+`benchmark_suite.py` artık **gerçek golden-set değerlendiricidir**: çalışan backend'e (`/api/query`) `tests/golden_set.json`'daki soruları sorar, cevabı `expect_any`/`forbid_any` ile kıyaslar, gecikme + politika + token ölçüp dürüst bir `aegis_benchmark_report.md` üretir. Önkoşul: backend ayakta + belgeler indekslenmiş + `golden_set.json` doğru `document_id`'lerle dolu.
 
 ## Mimari (Büyük Resim)
 

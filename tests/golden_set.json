@@ -1,0 +1,33 @@
+[
+  {
+    "document_id": 1,
+    "query": "Sistemde canlı METAR/TAF verileri hangi API'den alınıyor?",
+    "expect_any": ["AviationWeather"]
+  },
+  {
+    "document_id": 1,
+    "query": "Geçmiş Türkiye METAR verileri hangi arşivden indirildi?",
+    "expect_any": ["Iowa", "Mesonet"]
+  },
+  {
+    "document_id": 1,
+    "query": "Makine öğrenmesi modeli hangi meteorolojik sinyaller üzerinden risk skoru üretiyor?",
+    "expect_any": ["görünürlük", "RVR", "donma"]
+  },
+  {
+    "document_id": 1,
+    "query": "Hibrit skor nasıl hesaplanıyor?",
+    "expect_any": ["mlScore", "ruleScore", "0.65"]
+  },
+  {
+    "document_id": 1,
+    "query": "Canlı NOTAM için hangi sağlayıcı ve hangi meydanlar test edildi?",
+    "expect_any": ["SkyLink", "LTFJ"]
+  },
+  {
+    "document_id": 1,
+    "query": "Sistem kaç gerçek uçuş kazası verisiyle eğitildi?",
+    "expect_any": ["bulunmuyor", "yok"],
+    "forbid_any": ["kaza verisiyle eğitil"]
+  }
+]
