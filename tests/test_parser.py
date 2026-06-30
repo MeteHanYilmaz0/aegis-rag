@@ -90,6 +90,16 @@ class TestDoclingFailSafe(unittest.TestCase):
         # (çağıran PyMuPDF'e düşer — fail-safe). Var olmayan dosyada da güvenli olmalı.
         self.assertIsNone(TOCExtractor._try_docling("___yok___.pdf"))
 
+    def test_renumber_headings_from_section_numbers(self):
+        # Docling tüm başlıkları aynı seviyede verir; numaradan nesting yeniden kurulmalı.
+        md = "## 1 GİRİŞ\n## 1.1 Motivasyon\n## 3.2.1 Detay\n## ÖZET\ngövde metni"
+        out = TOCExtractor._renumber_markdown_headings(md).split("\n")
+        self.assertEqual(out[0], "# 1 GİRİŞ")          # H1
+        self.assertEqual(out[1], "## 1.1 Motivasyon")  # H2
+        self.assertEqual(out[2], "### 3.2.1 Detay")    # H3
+        self.assertEqual(out[3], "# ÖZET")             # numarasız → H1
+        self.assertEqual(out[4], "gövde metni")        # başlık değil, dokunulmaz
+
 
 class TestBookmarksUsable(unittest.TestCase):
     def test_too_few_bookmarks(self):

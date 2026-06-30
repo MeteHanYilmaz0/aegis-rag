@@ -23,6 +23,9 @@ EMBED_MODEL = os.getenv("AEGIS_EMBED_MODEL", "bge-m3")  # çok dilli/Türkçe g�
 # bağımlılıksız), "docling" (layout-model, alt-bölüm çözünürlüğü; opsiyonel paket),
 # "chandra" (taranmış/el-yazısı; opsiyonel). Docling/Chandra yoksa otomatik PyMuPDF'e düşer.
 PARSER = os.getenv("AEGIS_PARSER", "auto")
+# Docling layout modeli büyük PDF'lerde belleği kümülatif tüketir (16GB'da ~22. sayfada
+# std::bad_alloc). PDF parça parça dönüştürülür → tepe bellek sınırlı kalır.
+DOCLING_BATCH_PAGES = int(os.getenv("AEGIS_DOCLING_BATCH_PAGES", "10"))
 
 # Düğüm özetleri: True ise indekslemede her düğüm için LLM özeti üretilir (navigasyon
 # kalitesini artırır ama indekslemeyi yavaşlatır). False ise hızlı çıkarımsal (ilk N cümle)

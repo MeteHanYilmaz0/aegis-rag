@@ -90,22 +90,84 @@ class TOCExtractor:
         sayfa-provenance ileride iterate_items ile iyileştirilebilir.
         """
         try:
-            from docling.document_converter import DocumentConverter
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+            from docling.datamodel.base_models import InputFormat
+            from docling.datamodel.pipeline_options import PdfPipelineOptions
         except ImportError:
             return None
+
+        import tempfile
         try:
-            converter = DocumentConverter()
-            result = converter.convert(pdf_path)
-            markdown = result.document.export_to_markdown()
+            # Dijital PDF: OCR gereksiz (bellek/zaman ↓). Sayfa görüntülerini tutma.
+            opts = PdfPipelineOptions()
+            opts.do_ocr = False
+            opts.generate_page_images = False
+            converter = DocumentConverter(
+                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+            )
+
+            # SAYFA-PARÇALI dönüştürme: Docling büyük PDF'lerde belleği kümülatif tüketip
+            # ~22. sayfada std::bad_alloc veriyor (16GB). PDF'i küçük parçalara bölüp her
+            # parçayı ayrı dönüştürerek tepe belleği sınırlarız; markdown'ları birleştiririz.
+            src = fitz.open(pdf_path)
+            total = len(src)
+            batch = max(1, config.DOCLING_BATCH_PAGES)
+            md_parts = []
+            for start in range(0, total, batch):
+                end = min(start + batch, total)
+                chunk = fitz.open()
+                chunk.insert_pdf(src, from_page=start, to_page=end - 1)
+                tmp = os.path.join(tempfile.gettempdir(), f"_aegis_docling_{start}.pdf")
+                chunk.save(tmp)
+                chunk.close()
+                try:
+                    res = converter.convert(tmp)
+                    if getattr(res, "errors", None):
+                        src.close()
+                        return None  # parça kısmi başarısız → bütünlük bozulur, PyMuPDF'e düş
+                    md_parts.append(res.document.export_to_markdown())
+                except Exception:
+                    src.close()
+                    return None
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+            src.close()
+            markdown = "\n\n".join(md_parts)
         except Exception:
             return None
+
         if not markdown or not markdown.strip():
             return None
+        # Docling Markdown'ı başlıkları çoğu zaman tek seviyede verir; hiyerarşiyi başlık
+        # metnindeki numaralandırmadan (1.1 → 2. seviye) yeniden kur.
+        markdown = TOCExtractor._renumber_markdown_headings(markdown)
         nodes = TOCExtractor.extract_toc_tree(markdown)
-        # Tek düğümlük (başlık bulunamamış) çıktı bir kazanç değildir → PyMuPDF denesin.
         if len(nodes) <= 1:
             return None
         return nodes
+
+    @staticmethod
+    def _renumber_markdown_headings(markdown: str) -> str:
+        """
+        Markdown başlık seviyelerini, başlık metnindeki bölüm numarasından yeniden atar:
+        "1 GİRİŞ" → H1, "1.1 ..." → H2, "3.2.1 ..." → H3; numarasız başlık → H1.
+        (Docling tüm başlıkları aynı seviyede verince nesting kaybolduğu için gerekli.)
+        """
+        out = []
+        for line in markdown.split("\n"):
+            m = re.match(r"^#{1,6}\s+(.*)$", line)
+            if not m:
+                out.append(line)
+                continue
+            text = m.group(1).strip()
+            num = re.match(r"^(\d+(?:\.\d+)*)\b", text)
+            level = (num.group(1).count(".") + 1) if num else 1
+            out.append(f"{'#' * min(level, 5)} {text}")
+        return "\n".join(out)
+
 
     @staticmethod
     def _bookmarks_usable(meaningful: List[List[Any]], page_count: int) -> bool:
