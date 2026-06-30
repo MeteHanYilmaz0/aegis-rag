@@ -19,6 +19,11 @@ LLM_MODEL = os.getenv("AEGIS_LLM_MODEL", "qwen3:8b")            # navigasyon + s
 SUMMARY_MODEL = os.getenv("AEGIS_SUMMARY_MODEL", "qwen3:8b")    # düğüm özetleri (offline)
 EMBED_MODEL = os.getenv("AEGIS_EMBED_MODEL", "bge-m3")  # çok dilli/Türkçe güçlü; alt: nomic-embed-text
 
+# Parser katmanı: "auto" (gömülü TOC → Docling varsa → PyMuPDF), "pymupdf" (hızlı,
+# bağımlılıksız), "docling" (layout-model, alt-bölüm çözünürlüğü; opsiyonel paket),
+# "chandra" (taranmış/el-yazısı; opsiyonel). Docling/Chandra yoksa otomatik PyMuPDF'e düşer.
+PARSER = os.getenv("AEGIS_PARSER", "auto")
+
 # Düğüm özetleri: True ise indekslemede her düğüm için LLM özeti üretilir (navigasyon
 # kalitesini artırır ama indekslemeyi yavaşlatır). False ise hızlı çıkarımsal (ilk N cümle)
 # özet kullanılır. LLM çağrısı başarısız olursa otomatik çıkarımsal özete düşülür.

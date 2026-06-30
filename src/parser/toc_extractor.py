@@ -20,16 +20,26 @@ class TOCExtractor:
     #  Üst seviye giriş noktası
     # ------------------------------------------------------------------ #
     @staticmethod
-    def extract_tree(pdf_path: str, progress_callback=None, max_depth: int = None) -> List[Dict[str, Any]]:
+    def extract_tree(pdf_path: str, progress_callback=None, max_depth: int = None,
+                     parser: str = None) -> List[Dict[str, Any]]:
         """
-        Bir PDF'ten sonlandırılmış hiyerarşik ağacı döndürür.
-        Önce gömülü yer imlerini dener; yetersizse sezgisel Markdown yoluna düşer.
+        Bir PDF'ten sonlandırılmış hiyerarşik ağacı döndürür (katmanlı parser).
+
+        Öncelik: (1) güvenilir gömülü TOC/yer imi (her parser için bedava), yoksa
+        (2) içerik-tabanlı parser → `config.PARSER` ile seçilir:
+          - "docling"/"auto": Docling (layout-model, alt-bölüm çözünürlüğü) kuruluysa onu,
+            değilse PyMuPDF sezgisel yola düşer (fail-safe).
+          - "pymupdf": doğrudan sezgisel (hızlı, bağımlılıksız).
+        Tüm yollar `finalize_tree` ile sonlanır (veri modeli değişmez).
         """
         if max_depth is None:
             max_depth = config.MAX_TREE_DEPTH
+        if parser is None:
+            parser = config.PARSER
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"PDF dosyası bulunamadı: {pdf_path}")
 
+        # 1. Gömülü yer imi önceliği (parser-bağımsız, bedava)
         doc = fitz.open(pdf_path)
         try:
             page_count = len(doc)
@@ -39,18 +49,63 @@ class TOCExtractor:
                 if e[1] and e[1].strip()
                 and e[1].strip().lower() not in ("boş sayfa", "bos sayfa", "blank page")
             ]
-            if TOCExtractor._bookmarks_usable(meaningful, page_count):
-                nodes = TOCExtractor._build_from_bookmarks(doc, meaningful)
-            else:
-                nodes = None  # sezgisel yol (doc'u kapatıp ayrı açacağız)
+            nodes = TOCExtractor._build_from_bookmarks(doc, meaningful) \
+                if TOCExtractor._bookmarks_usable(meaningful, page_count) else None
         finally:
             doc.close()
 
+        # 2. İçerik-tabanlı parser (yer imi yoksa)
         if nodes is None:
-            markdown = TOCExtractor.convert_pdf_to_markdown(pdf_path, progress_callback=progress_callback)
-            nodes = TOCExtractor.extract_toc_tree(markdown)
+            nodes = TOCExtractor._parse_content(pdf_path, parser, progress_callback)
 
         return TOCExtractor.finalize_tree(nodes, max_depth)
+
+    @staticmethod
+    def _parse_content(pdf_path: str, parser: str, progress_callback=None) -> List[Dict[str, Any]]:
+        """İçerik-tabanlı ayrıştırma. Docling istenmiş/uygunsa onu dener; aksi/başarısızsa PyMuPDF."""
+        if parser in ("docling", "auto"):
+            docling_nodes = TOCExtractor._try_docling(pdf_path)
+            if docling_nodes:
+                return docling_nodes
+            # parser="docling" açıkça istenip yoksa sessizce PyMuPDF'e düşeriz (fail-safe).
+
+        markdown = TOCExtractor.convert_pdf_to_markdown(pdf_path, progress_callback=progress_callback)
+        return TOCExtractor.extract_toc_tree(markdown)
+
+    @staticmethod
+    def _try_docling(pdf_path: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Docling (IBM) ile ağaç çıkarımı — opsiyonel "iyi kat".
+
+        Docling layout-model tabanlıdır; başlık hiyerarşisini font-heuristic'e bağlı kalmadan
+        algılar (Word auto-numbering metinde olmasa bile alt-bölümleri ayrı düğüm yapar).
+        Belgeyi Markdown'a çevirip (başlık seviyeleri korunur) mevcut `extract_toc_tree`'ye
+        verir → tüm ağaç mantığı yeniden kullanılır.
+
+        Docling kurulu değilse (`pip install docling`) veya hata verirse None döner →
+        çağıran PyMuPDF sezgisel yola düşer (fail-safe; "16GB'da çalışır" vaadi korunur).
+
+        Not (v1): Docling Markdown'ı `<!-- Page N -->` işareti taşımadığından sayfa atfı
+        bölüm-seviyesine iner (start_page kesin sayfa vermez). Yapısal çözünürlük önceliklidir;
+        sayfa-provenance ileride iterate_items ile iyileştirilebilir.
+        """
+        try:
+            from docling.document_converter import DocumentConverter
+        except ImportError:
+            return None
+        try:
+            converter = DocumentConverter()
+            result = converter.convert(pdf_path)
+            markdown = result.document.export_to_markdown()
+        except Exception:
+            return None
+        if not markdown or not markdown.strip():
+            return None
+        nodes = TOCExtractor.extract_toc_tree(markdown)
+        # Tek düğümlük (başlık bulunamamış) çıktı bir kazanç değildir → PyMuPDF denesin.
+        if len(nodes) <= 1:
+            return None
+        return nodes
 
     @staticmethod
     def _bookmarks_usable(meaningful: List[List[Any]], page_count: int) -> bool:

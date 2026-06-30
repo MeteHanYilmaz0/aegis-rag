@@ -84,6 +84,13 @@ class TestFinalizeTree(unittest.TestCase):
         self.assertEqual(l3["is_leaf"], 1)
 
 
+class TestDoclingFailSafe(unittest.TestCase):
+    def test_try_docling_returns_none_gracefully(self):
+        # Docling kurulu değilse (ImportError) ya da dönüştürme hata verirse None dönmeli
+        # (çağıran PyMuPDF'e düşer — fail-safe). Var olmayan dosyada da güvenli olmalı.
+        self.assertIsNone(TOCExtractor._try_docling("___yok___.pdf"))
+
+
 class TestBookmarksUsable(unittest.TestCase):
     def test_too_few_bookmarks(self):
         # 1 anlamlı yer imi -> kullanılamaz
