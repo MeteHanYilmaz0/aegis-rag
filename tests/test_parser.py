@@ -98,10 +98,19 @@ class TestFinalizeTree(unittest.TestCase):
         self.assertIn("1 GİRİŞ", headings)
 
 
+def _docling_installed():
+    try:
+        import docling  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 class TestDoclingFailSafe(unittest.TestCase):
+    @unittest.skipIf(_docling_installed(),
+                     "docling kurulu → DocumentConverter modeli yükler (yavaş); fail-safe asıl docling-yok yolunda kritik")
     def test_try_docling_returns_none_gracefully(self):
-        # Docling kurulu değilse (ImportError) ya da dönüştürme hata verirse None dönmeli
-        # (çağıran PyMuPDF'e düşer — fail-safe). Var olmayan dosyada da güvenli olmalı.
+        # Docling kurulu DEĞİLSE (ImportError) None dönmeli (çağıran PyMuPDF'e düşer — fail-safe).
         self.assertIsNone(TOCExtractor._try_docling("___yok___.pdf"))
 
     def test_renumber_headings_from_section_numbers(self):
