@@ -1,5 +1,9 @@
 # FAZ 5 — Aegis Engine: Parser- ve Model-Agnostik Belge Sohbet Motoru
 
+> **İLERLEME (2026-07-04):** ✅ 5.1 (sözleşmeler) · ✅ 5.3 (retrieval tabanı) · ✅ 5.2 (dayanıklılık)
+> · ✅ 5.4 (ablation) tamam ve commit'li (40 test geçiyor). **KALAN: 5.5 (çok-belge+sohbet),
+> 5.6 (servisleşme), Faz 6 (paper).** Detaylar hafızada (`project-roadmap`). Aşağıdaki §5.5/§5.6/§9'dan devam.
+
 > **Bu belge, uygulayıcı agent (Opus) için kendi kendine yeterli bir iş planıdır.**
 > Mevcut mimariyi anlamak için önce `CLAUDE.md` ve `project_brain.md` (§6-7) okunmalıdır.
 > Çalışma dizini proje köküdür; testler `python -m unittest discover tests` ile koşar (26 test, hepsi geçiyor olmalı).
