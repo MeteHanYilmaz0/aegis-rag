@@ -170,6 +170,18 @@ Motorun kalitesi modele değil kendine dayansın diye **model-gerektirmeyen** iy
 | 5 | **5.5 Çok-belge/sohbet** | Ürün özelliği; çekirdek stabilken |
 | 6 | **5.6 Servisleşme** | En son cila/paketleme |
 
+## 9. Faz 6 — Frontier/Paper yolu (Faz 5 bittikten sonra)
+
+Hedef: standart benchmark'larda (FinanceBench + QASPER benzeri yapı-ağırlıklı set + kendi Türkçe set) tamamen yerel, 16GB donanımda frontier'a yakın doğruluk; arXiv preprint + workshop/industry-track paper. İddia "PageIndex'i geçtik" DEĞİL, "frontier doğruluğunun %X'i sıfır bulut maliyetiyle" olmalıdır.
+
+1. **Dil-adaptif prompt'lar** (ön koşul): descent/sentez/özet prompt'ları `config.LANG` veya sorgu-dili algılamayla TR/EN; İngilizce benchmark bunsuz koşulamaz.
+2. **Benchmark harness**: `aegis-bench`'e FinanceBench/QASPER yükleyici (soru+belge+altın cevap formatı); LLM-hakem yerine önce exact/substring + insan örneklem denetimi.
+3. **Grounded-citation doğrulayıcı** (deterministik, LLM'siz): sentez cümlelerinin bağlam pasajlarıyla n-gram örtüşmesi; desteksiz cümle işaretlenir/düşürülür. (Self-NLI geri GELMEZ — testlerde güvenilmezdi.)
+4. **Tablo-QA güçlendirme**: tablo hücrelerini "satır başlığı | sütun başlığı | değer" üçlüsü olarak da embed et.
+5. **Ölçekleme eğrisi deneyi**: aynı seti qwen3 4B/8B/14B/32B ile koş; "doğruluk vs model boyutu" grafiği (düz eğri = kaliteyi sistem taşıyor tezinin kanıtı).
+6. **Ablation zinciri** (5.4 üstüne): saf RAG → +ağaç → +çift-hat → +ısı-ata-yayılımı → tam sistem; her satır izole katkı + gecikme + RAM.
+7. **İlgili çalışma zorunlu okuma**: RAPTOR (en yakın iş — özet-ağacı vs bizim gerçek-yapı ağacı ayrımı net yazılmalı), PageIndex, GraphRAG, Self-RAG, LongRAG.
+
 **Genel kurallar (uygulayıcı için):**
 - Her faz sonunda: tüm testler geçer + `git commit` (Türkçe mesaj, **Co-Authored-By trailer'ı KOYMA**) + `CLAUDE.md`/`project_brain.md` güncellenir.
 - Mevcut davranışı bozan hiçbir değişiklik testsiz girmez; şüphede tez PDF'i (`C:/Users/mete_/Desktop/Flight-risk-thesis.pdf`) ile `tools/compare_parsers.py` ve golden-set koşulur.
