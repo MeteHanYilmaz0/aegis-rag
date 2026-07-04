@@ -52,8 +52,14 @@ SCOPED_TOP_K = 30          # yaprak-içi/kapsam-içi arama ham aday (büyük yap
 RERANK_TOP_K = 5           # heatmap için tutulan düğüm sayısı
 CONTEXT_PASSAGES = 10      # sentezе beslenen pasaj sayısı (hız/recall dengesi; 12→10)
 SUMMARY_WORKERS = 4        # indekslemede özetleri paralel üret (bounded thread havuzu)
-RERANK_COSINE_WEIGHT = 0.6
-RERANK_LEXICAL_WEIGHT = 0.4
+RERANK_COSINE_WEIGHT = 0.6   # dış karışım: kosinüs (semantik) ağırlığı
+RERANK_LEXICAL_WEIGHT = 0.4  # dış karışım: lexical (BM25+ngram) ağırlığı
+# Lexical hat (model-bağımsız): BM25 IDF'li + karakter 3-gram (Türkçe ekleri stemmer'sız çözer).
+BM25_K1 = 1.5
+BM25_B = 0.75
+LEXICAL_BM25_WEIGHT = 0.6    # lexical iç karışım: BM25 payı
+LEXICAL_NGRAM_WEIGHT = 0.4   # lexical iç karışım: karakter n-gram payı
+LEXICAL_NGRAM_N = 3
 
 # --- Bağlam ekonomisi ---
 TOKEN_BUDGET = 4000

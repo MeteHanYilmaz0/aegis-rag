@@ -45,6 +45,17 @@ class TestChunkText(unittest.TestCase):
         self.assertEqual(DBManager._chunk_text(self.db, ""), [])
         self.assertEqual(DBManager._chunk_text(self.db, "   "), [])
 
+    def test_table_kept_intact(self):
+        # Markdown tablo bloğu bölünmez birim olmalı (reflow'la ezilmemeli, tek chunk).
+        content = ("Giriş paragrafı.\n\n| Sinyal | Ağırlık |\n| --- | --- |\n"
+                   "| ml | 0.65 |\n| rule | 0.25 |\n\nSonuç paragrafı.")
+        chunks = DBManager._chunk_text(self.db, content)
+        tables = [c for c in chunks if c.strip().startswith("|")]
+        self.assertEqual(len(tables), 1)
+        self.assertIn("| ml | 0.65 |", tables[0])
+        self.assertIn("| rule | 0.25 |", tables[0])
+        self.assertIn("\n", tables[0])   # tablo satır yapısı korundu (reflow yok)
+
 
 if __name__ == "__main__":
     unittest.main()

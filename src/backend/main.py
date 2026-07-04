@@ -1,5 +1,6 @@
 import os
 import re
+import math
 import json
 import shutil
 import tempfile
@@ -15,6 +16,7 @@ from src import config
 from src.parser.toc_extractor import TOCExtractor
 from src.database.db_manager import DBManager
 from src.contracts.llm import get_llm, strip_think
+from src.engine.rerank import rerank as engine_rerank
 
 app = FastAPI(title="Aegis RAG API", description="Frontier Systems-Oriented Hybrid RAG Backend with Context Economy and Execution Policy")
 
@@ -63,36 +65,8 @@ def calculate_approx_tokens(text: str) -> int:
     return int(words * config.TOKEN_PER_WORD)
 
 def lexical_semantic_rerank(query: str, candidates: List[Dict[str, Any]], top_k: int = 3) -> List[Dict[str, Any]]:
-    """
-    Kaynak Verimli Hibrit Yeniden Sıralayıcı (Lexical-Semantic Reranker).
-    Cosine Benzerliği (ChromaDB) ile BM25 benzeri Kelime Çakışma (Lexical) skorlarını harmanlar.
-    """
-    if not candidates:
-        return []
-        
-    query_terms = set(re.findall(r'\w+', query.lower()))
-    if not query_terms:
-        return candidates[:top_k]
-        
-    for cand in candidates:
-        doc_content = cand["content"].lower()
-        doc_words = re.findall(r'\w+', doc_content)
-        doc_words_set = set(doc_words)
-        
-        # Kelime çakışma oranı (Lexical Score)
-        overlap = query_terms.intersection(doc_words_set)
-        lexical_score = len(overlap) / len(query_terms) if query_terms else 0.0
-        
-        # Hibrit Skor Formülü (ağırlıklar config'ten)
-        cand["hybrid_score"] = round(
-            config.RERANK_COSINE_WEIGHT * cand["similarity"]
-            + config.RERANK_LEXICAL_WEIGHT * lexical_score,
-            4,
-        )
-        
-    # Hibrit skora göre yeniden sırala
-    reranked = sorted(candidates, key=lambda x: x["hybrid_score"], reverse=True)
-    return reranked[:top_k]
+    """Lexical-Semantik yeniden sıralayıcı (model-bağımsız BM25+n-gram; bkz. src/engine/rerank.py)."""
+    return engine_rerank(query, candidates, top_k)
 
 @app.get("/api/health")
 def health_check():
@@ -444,15 +418,21 @@ def _build_query_context(document_id: int, query: str, model_name: str):
     # ==========================================
     # Sorgu embedding'i bir kez hesaplanır; hem global heatmap hem scoped aramada paylaşılır.
     query_embedding = db_manager.embedder.embed_query(query)
-    semantic_raw = db_manager.query_chroma(document_id, query, top_k=config.SEMANTIC_TOP_K,
+    # Isı haritasını daha çok chunk'tan kur (seyrek sinyali yoğunlaştır).
+    semantic_raw = db_manager.query_chroma(document_id, query, top_k=config.SCOPED_TOP_K,
                                            query_embedding=query_embedding)
-    reranked_hits = lexical_semantic_rerank(query, semantic_raw, top_k=config.RERANK_TOP_K)
-    heatmap_scores = {}
-    for hit in reranked_hits:
+    scored_hits = lexical_semantic_rerank(query, semantic_raw, top_k=config.SCOPED_TOP_K)
+    reranked_hits = scored_hits[:config.RERANK_TOP_K]   # global fallback bağlamı için ilk-k
+    # YOĞUNLAŞTIRMA: düğüm skoru = en iyi chunk skoru × (1 + 0.1·log2(eşleşen chunk sayısı)).
+    # Yoğun eşleşen bölüm, tek şanslı eşleşmeden ayrışır.
+    node_chunk_scores: Dict[Any, List[float]] = {}
+    for hit in scored_hits:
         n_id = hit["metadata"].get("node_id")
-        score = hit["hybrid_score"]
-        if n_id not in heatmap_scores or score > heatmap_scores[n_id]:
-            heatmap_scores[n_id] = score
+        node_chunk_scores.setdefault(n_id, []).append(hit["hybrid_score"])
+    heatmap_scores = {
+        n_id: round(max(scs) * (1 + 0.1 * math.log2(len(scs))), 4)
+        for n_id, scs in node_chunk_scores.items()
+    }
     trace.append(f"🔥 **Semantik Isı Haritası:** {len(heatmap_scores)} düğüm pozitif eşleşme aldı.")
 
     # ==========================================

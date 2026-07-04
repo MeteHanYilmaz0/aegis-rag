@@ -8,6 +8,8 @@ Aegis RAG; tamamen yerel (Ollama) çalışan, bulutsuz, gizlilik-öncelikli bir 
 
 İletişim dili Türkçe'dir (kod yorumları, prompt'lar, UI ve dokümanlar Türkçe).
 
+**Aegis bir MOTOR'dur (Faz 5+):** Amaç, şirketlerin kendi parser'larını ve kendi local modellerini takıp kaliteyi orkestrasyonla almalarıdır. `src/contracts/` sözleşme katmanı: `BaseParser`+`RawNode` (parser), `BaseLLM` (ollama / openai_compat = vLLM/LM Studio/llama.cpp), `BaseEmbedder`. Core Engine somut parser/model adı bilmez; yalnız `get_llm()`/`get_embedder()`/parser registry'yi kullanır. Şirket parser'ı `config.PARSER="paket.modul:Sinif"` ile takılır. Tüm yol haritası + uygulama spec'i: `FAZ5_ENGINE_PLAN.md`.
+
 ## Çalıştırma Komutları
 
 Tüm komutlar proje kök dizininden (`src/`'nin bulunduğu yer) çalıştırılır. Modüller `src.paket.modul` olarak import edildiğinden **çalışma dizini kök olmalıdır**.

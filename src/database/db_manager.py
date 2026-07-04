@@ -149,36 +149,72 @@ class DBManager:
 
     def _chunk_text(self, content: str) -> List[str]:
         """
-        İçeriği cümle-duyarlı, örtüşmeli (overlap) sabit-boy chunk'lara böler.
-
-        Ham `\\n\\n` bölme, PDF satır-kırılmasında her fiziksel satırı (~90 karakter) ayrı
-        chunk yapıp cümleleri/bilgileri parçalıyordu (kesin bilgi retrieve edilemiyordu).
-        Burada metin önce REFLOW edilir (satır-sonu tirelemesi birleştirilir, boşluklar
-        normalize edilir), cümlelere ayrılır ve ~CHUNK_SIZE_CHARS boyutunda, sondan
-        ~CHUNK_OVERLAP_CHARS örtüşmeli chunk'lara paketlenir.
+        İçeriği cümle-duyarlı, örtüşmeli chunk'lara böler. Markdown TABLO blokları
+        (ardışık `|...|` satırları) bölünmez birim olarak korunur (reflow uygulanmaz);
+        tablo çok büyükse başlık satırı tekrarlanarak satır-satır bölünür. Prose kısmı
+        reflow (satır-sonu tirelemesi birleştir + boşluk sadeleştir) + cümle paketleme.
         """
         if not content or not content.strip():
             return []
-        # Satır-sonu tirelemesi: "Tür-\nkiye" -> "Türkiye" (gerçek tireler -proxy-risk- korunur)
-        text = re.sub(r"-\s*\n\s*", "", content)
-        # Kalan satır kırılmalarını boşluğa çevir, çoklu boşlukları sadeleştir
-        text = re.sub(r"\s+", " ", text).strip()
+        # Segmentlere ayır: tablo blokları vs prose (tablo satırları reflow'la ezilmesin)
+        chunks: List[str] = []
+        buf: List[str] = []
+        buf_is_table = False
+
+        def flush():
+            if not buf:
+                return
+            seg = "\n".join(buf).strip()
+            if seg:
+                chunks.extend(self._chunk_table(seg) if buf_is_table else self._chunk_prose(seg))
+
+        for line in content.split("\n"):
+            row_is_table = line.strip().startswith("|")
+            if row_is_table != buf_is_table and buf:
+                flush()
+                buf = []
+            buf_is_table = row_is_table
+            buf.append(line)
+        flush()
+        return chunks
+
+    def _chunk_prose(self, text: str) -> List[str]:
+        text = re.sub(r"-\s*\n\s*", "", text)     # satır-sonu tirelemesi: "Tür-\nkiye"→"Türkiye"
+        text = re.sub(r"\s+", " ", text).strip()  # kalan satır kırılmalarını boşluğa çevir
         if not text:
             return []
-
         sentences = re.split(r"(?<=[.!?])\s+", text)
         size, overlap = config.CHUNK_SIZE_CHARS, config.CHUNK_OVERLAP_CHARS
-        chunks: List[str] = []
-        cur = ""
+        chunks, cur = [], ""
         for s in sentences:
             if cur and len(cur) + len(s) + 1 > size:
                 chunks.append(cur.strip())
-                tail = cur[-overlap:].strip()  # bağlam sürekliliği için örtüşme
-                cur = f"{tail} {s}".strip()
+                cur = f"{cur[-overlap:].strip()} {s}".strip()  # örtüşme
             else:
                 cur = f"{cur} {s}".strip() if cur else s
         if cur.strip():
             chunks.append(cur.strip())
+        return chunks
+
+    def _chunk_table(self, table: str) -> List[str]:
+        """Tabloyu bölünmez tut; CHUNK_SIZE'ı aşarsa başlık(+ayraç) satırını tekrarlayarak böl."""
+        if len(table) <= config.CHUNK_SIZE_CHARS:
+            return [table]
+        rows = table.split("\n")
+        header = rows[:2] if len(rows) >= 2 else rows[:1]   # başlık + '---' ayraç
+        body = rows[len(header):]
+        chunks, cur = [], list(header)
+        cur_len = sum(len(r) for r in header)
+        for r in body:
+            if cur_len + len(r) > config.CHUNK_SIZE_CHARS and len(cur) > len(header):
+                chunks.append("\n".join(cur))
+                cur = list(header) + [r]
+                cur_len = sum(len(x) for x in cur)
+            else:
+                cur.append(r)
+                cur_len += len(r)
+        if len(cur) > len(header) or not chunks:
+            chunks.append("\n".join(cur))
         return chunks
 
     def add_document(self, filename: str, file_path: str, toc_nodes: List[Dict[str, Any]], progress_callback=None) -> int:
@@ -259,7 +295,15 @@ class DBManager:
             content = (node.get("content") or "").strip()
             if content:
                 paragraphs = self._chunk_text(content)
+                sp, ep = node.get("start_page"), node.get("end_page")
+                n_par = len(paragraphs)
                 for p_idx, para in enumerate(paragraphs):
+                    # Chunk-düzeyi sayfa: chunk'ı düğümün sayfa aralığına orantılı dağıt
+                    # (düğümün tek start_page'inden daha isabetli alıntı).
+                    if sp and ep and ep > sp and n_par > 1:
+                        page = sp + round((p_idx / (n_par - 1)) * (ep - sp))
+                    else:
+                        page = sp if sp else -1
                     chroma_ids.append(f"doc_{document_id}_node_{node['id']}_p_{p_idx}")
                     chroma_documents.append(para)
                     chroma_metadatas.append({
@@ -267,7 +311,7 @@ class DBManager:
                         "node_id": node["id"],
                         "path": node["path"],
                         "heading": node["heading"],
-                        "start_page": node.get("start_page") if node.get("start_page") is not None else -1,
+                        "start_page": page,
                     })
 
         if chroma_documents:
