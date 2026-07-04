@@ -19,6 +19,16 @@ LLM_MODEL = os.getenv("AEGIS_LLM_MODEL", "qwen3:8b")            # navigasyon + s
 SUMMARY_MODEL = os.getenv("AEGIS_SUMMARY_MODEL", "qwen3:8b")    # düğüm özetleri (offline)
 EMBED_MODEL = os.getenv("AEGIS_EMBED_MODEL", "bge-m3")  # çok dilli/Türkçe güçlü; alt: nomic-embed-text
 
+# --- Sağlayıcılar (model-agnostiklik) ---
+# LLM/Embedder somut sunucudan soyutlanır. "ollama" veya "openai_compat" (vLLM, LM Studio,
+# llama.cpp gibi OpenAI-uyumlu local endpoint). Şirket kendi local modelini böyle takar.
+LLM_PROVIDER = os.getenv("AEGIS_LLM_PROVIDER", "ollama")
+LLM_BASE_URL = os.getenv("AEGIS_LLM_BASE_URL", OLLAMA_URL)      # openai_compat için http://host:port/v1
+LLM_API_KEY = os.getenv("AEGIS_LLM_API_KEY", "not-needed")      # local sunucular genelde anahtar istemez
+EMBED_PROVIDER = os.getenv("AEGIS_EMBED_PROVIDER", "ollama")
+EMBED_BASE_URL = os.getenv("AEGIS_EMBED_BASE_URL", OLLAMA_URL)
+EMBED_API_KEY = os.getenv("AEGIS_EMBED_API_KEY", "not-needed")
+
 # Parser katmanı: "auto" (gömülü TOC → Docling varsa → PyMuPDF), "pymupdf" (hızlı,
 # bağımlılıksız), "docling" (layout-model, alt-bölüm çözünürlüğü; opsiyonel paket),
 # "chandra" (taranmış/el-yazısı; opsiyonel). Docling/Chandra yoksa otomatik PyMuPDF'e düşer.

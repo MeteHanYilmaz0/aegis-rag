@@ -14,6 +14,7 @@ from typing import List, Dict, Any, Optional
 from src import config
 from src.parser.toc_extractor import TOCExtractor
 from src.database.db_manager import DBManager
+from src.contracts.llm import get_llm, strip_think
 
 app = FastAPI(title="Aegis RAG API", description="Frontier Systems-Oriented Hybrid RAG Backend with Context Economy and Execution Policy")
 
@@ -47,30 +48,6 @@ def check_ollama_status() -> bool:
         return response.status_code == 200
     except Exception:
         return False
-
-def strip_think(text: str) -> str:
-    """Thinking modellerinin (qwen3 vb.) <think>...</think> bloklarını yanıttan ayıklar."""
-    return re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-
-def ollama_generate(model: str, prompt: str, temperature: Optional[float] = None,
-                    timeout: int = config.OLLAMA_GENERATE_TIMEOUT) -> str:
-    """
-    Ollama /api/generate çağrısı için tek giriş noktası.
-    Thinking'i kapatır (JSON/sentez yanıtını kirletmesin) ve <think> bloklarını ayıklar.
-    Hata durumunda istisna fırlatır; çağıran tarafta yakalanır.
-    """
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "think": config.LLM_THINKING,
-        "keep_alive": config.OLLAMA_KEEP_ALIVE,
-    }
-    if temperature is not None:
-        payload["options"] = {"temperature": temperature}
-    response = requests.post(f"{OLLAMA_URL}/api/generate", json=payload, timeout=timeout)
-    response.raise_for_status()
-    return strip_think(response.json().get("response", ""))
 
 def clean_json_response(text: str) -> str:
     """LLM'den gelen JSON yanıtı temizler (önce olası <think> bloğunu ayıklar)."""
@@ -315,7 +292,7 @@ YÖNERGELER:
 
 def _ask_descent(model_name: str, query: str, frontier: List[Dict[str, Any]], heatmap: Dict[Any, float]):
     try:
-        raw = ollama_generate(model_name, _descent_prompt(query, frontier, heatmap), temperature=0.0)
+        raw = get_llm(model_name).generate(_descent_prompt(query, frontier, heatmap), temperature=0.0)
         data = json.loads(clean_json_response(raw))
         return data if isinstance(data, dict) else None
     except Exception:
@@ -603,7 +580,7 @@ def query_aegis(payload: QueryRequest):
         raise HTTPException(status_code=503, detail="Yerel Ollama servisine bağlanılamadı.")
     qa_prompt, meta = _build_query_context(payload.document_id, payload.query, payload.model_name)
     try:
-        candidate = ollama_generate(payload.model_name, qa_prompt).strip()
+        candidate = get_llm(payload.model_name).generate(qa_prompt).strip()
         answer = candidate if candidate else "Model boş yanıt döndürdü."
     except Exception as e:
         answer = f"Sorgu işlenirken bir hata oluştu: {str(e)}"
@@ -621,24 +598,13 @@ def query_aegis_stream(payload: QueryRequest):
         raise HTTPException(status_code=503, detail="Yerel Ollama servisine bağlanılamadı.")
     qa_prompt, meta = _build_query_context(payload.document_id, payload.query, payload.model_name)
 
+    llm = get_llm(payload.model_name)
+
     def generate():
         yield json.dumps(meta, ensure_ascii=False) + "\n"
         try:
-            with requests.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={"model": payload.model_name, "prompt": qa_prompt, "stream": True,
-                      "think": config.LLM_THINKING, "keep_alive": config.OLLAMA_KEEP_ALIVE},
-                stream=True, timeout=config.OLLAMA_GENERATE_TIMEOUT,
-            ) as r:
-                for line in r.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        piece = json.loads(line).get("response", "")
-                    except Exception:
-                        continue
-                    if piece:
-                        yield piece
+            for piece in llm.generate_stream(qa_prompt):
+                yield piece
         except Exception as e:
             yield f"\n[Sentez hatası: {str(e)}]"
 

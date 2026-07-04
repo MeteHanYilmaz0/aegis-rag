@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 import fitz  # PyMuPDF
 
 from src import config
+from src.contracts.parser import RawNode, BaseParser, register_parser, get_parser
 
 
 class TOCExtractor:
@@ -40,37 +41,34 @@ class TOCExtractor:
             raise FileNotFoundError(f"PDF dosyası bulunamadı: {pdf_path}")
 
         # 1. Gömülü yer imi önceliği (parser-bağımsız, bedava)
-        doc = fitz.open(pdf_path)
-        try:
-            page_count = len(doc)
-            toc = doc.get_toc(simple=True)
-            meaningful = [
-                e for e in toc
-                if e[1] and e[1].strip()
-                and e[1].strip().lower() not in ("boş sayfa", "bos sayfa", "blank page")
-            ]
-            nodes = TOCExtractor._build_from_bookmarks(doc, meaningful) \
-                if TOCExtractor._bookmarks_usable(meaningful, page_count) else None
-        finally:
-            doc.close()
+        raw = BookmarkParser().parse(pdf_path)
+        # 2. Yoksa içerik-tabanlı parser zinciri (auto: docling→pymupdf; sonu her zaman PyMuPDF)
+        if not raw:
+            for p in TOCExtractor._content_parser_chain(parser):
+                raw = p.parse(pdf_path, progress_callback)
+                if raw:
+                    break
 
-        # 2. İçerik-tabanlı parser (yer imi yoksa)
-        if nodes is None:
-            nodes = TOCExtractor._parse_content(pdf_path, parser, progress_callback)
-
-        return TOCExtractor.finalize_tree(nodes, max_depth)
+        # RawNode (IR) → motor: id/parent/path + finalize (veri modeli değişmez)
+        return build_tree_from_raw(raw, max_depth)
 
     @staticmethod
-    def _parse_content(pdf_path: str, parser: str, progress_callback=None) -> List[Dict[str, Any]]:
-        """İçerik-tabanlı ayrıştırma. Docling istenmiş/uygunsa onu dener; aksi/başarısızsa PyMuPDF."""
-        if parser in ("docling", "auto"):
-            docling_nodes = TOCExtractor._try_docling(pdf_path)
-            if docling_nodes:
-                return docling_nodes
-            # parser="docling" açıkça istenip yoksa sessizce PyMuPDF'e düşeriz (fail-safe).
-
-        markdown = TOCExtractor.convert_pdf_to_markdown(pdf_path, progress_callback=progress_callback)
-        return TOCExtractor.extract_toc_tree(markdown)
+    def _content_parser_chain(parser: str) -> List[BaseParser]:
+        """
+        config.PARSER → denenecek içerik parser'ları. Zincir her zaman PyMuPDF ile biter
+        (fail-safe). Şirket parser'ı: kayıtlı ad ya da "paket.modul:Sinif".
+        """
+        pymupdf = PyMuPDFParser()
+        if parser == "pymupdf":
+            return [pymupdf]
+        if parser in ("auto", "docling"):
+            return [DoclingParser(), pymupdf]
+        if parser == "chandra":
+            return [pymupdf]  # Chandra adaptörü (Faz 4c) henüz yok
+        try:
+            return [get_parser(parser), pymupdf]  # özel/harici parser
+        except Exception:
+            return [pymupdf]
 
     @staticmethod
     def _try_docling(pdf_path: str) -> Optional[List[Dict[str, Any]]]:
@@ -642,3 +640,100 @@ class TOCExtractor:
             n.setdefault("end_line", None)
 
         return kept
+
+
+# ====================================================================== #
+#  Motor: RawNode (IR) → ağaç  +  içerik parser adaptörleri (sözleşme)
+# ====================================================================== #
+
+def _rawnodes_from_full(full_nodes: List[Dict[str, Any]]) -> List[RawNode]:
+    """Mevcut tam-düğüm çıktısını (id/parent/path'li) RawNode IR'ına indirger."""
+    return [
+        RawNode(heading=n["heading"], level=n["level"], content=n.get("content", ""),
+                start_page=n.get("start_page"), end_page=n.get("end_page"))
+        for n in full_nodes
+    ]
+
+
+def build_tree_from_raw(raw_nodes: List[RawNode], max_depth: int) -> List[Dict[str, Any]]:
+    """
+    RawNode listesinden hiyerarşik ağaç kurar: (heading, level) dizisinden stack ile
+    id/parent/path üretir, sonra `finalize_tree` (depth fold + is_leaf + gürültü filtresi).
+    Motorun tek yapısal giriş noktası — hangi parser üretmiş olursa olsun aynı işler.
+    """
+    nodes: List[Dict[str, Any]] = []
+    stack: Dict[int, int] = {}
+    for rn in raw_nodes:
+        level = rn.level
+        parent_idx, parent_path = None, ""
+        for l in range(level - 1, 0, -1):
+            if l in stack:
+                parent_idx = stack[l]
+                parent_path = nodes[parent_idx]["path"]
+                break
+        full_path = f"{parent_path} > {rn.heading}" if parent_path else rn.heading
+        idx = len(nodes)
+        nodes.append({
+            "id": idx + 1,
+            "heading": rn.heading,
+            "level": level,
+            "parent_id": nodes[parent_idx]["id"] if parent_idx is not None else None,
+            "path": full_path,
+            "content": rn.content or "",
+            "start_page": rn.start_page,
+            "end_page": rn.end_page,
+            "start_line": None,
+            "end_line": None,
+        })
+        stack[level] = idx
+        for l in list(stack.keys()):
+            if l > level:
+                del stack[l]
+    if not nodes:
+        return []
+    return TOCExtractor.finalize_tree(nodes, max_depth)
+
+
+class BookmarkParser(BaseParser):
+    """Gömülü TOC/yer imi (yeterince güvenilirse). Değilse boş liste → sonraki parser."""
+    name = "bookmark"
+
+    def parse(self, file_path, progress_cb=None) -> List[RawNode]:
+        doc = fitz.open(file_path)
+        try:
+            page_count = len(doc)
+            toc = doc.get_toc(simple=True)
+            meaningful = [
+                e for e in toc
+                if e[1] and e[1].strip()
+                and e[1].strip().lower() not in ("boş sayfa", "bos sayfa", "blank page")
+            ]
+            if not TOCExtractor._bookmarks_usable(meaningful, page_count):
+                return []
+            full = TOCExtractor._build_from_bookmarks(doc, meaningful)
+        finally:
+            doc.close()
+        return _rawnodes_from_full(full)
+
+
+class PyMuPDFParser(BaseParser):
+    """Hızlı, bağımlılıksız sezgisel (font/koordinat + slayt-duyarlı). Varsayılan / fail-safe."""
+    name = "pymupdf"
+
+    def parse(self, file_path, progress_cb=None) -> List[RawNode]:
+        markdown = TOCExtractor.convert_pdf_to_markdown(file_path, progress_callback=progress_cb)
+        return _rawnodes_from_full(TOCExtractor.extract_toc_tree(markdown))
+
+
+class DoclingParser(BaseParser):
+    """Layout-model "iyi kat" (alt-bölüm çözünürlüğü). Kurulu değil/başarısızsa boş → PyMuPDF."""
+    name = "docling"
+
+    def parse(self, file_path, progress_cb=None) -> List[RawNode]:
+        full = TOCExtractor._try_docling(file_path)
+        return _rawnodes_from_full(full) if full else []
+
+
+register_parser("bookmark", BookmarkParser)
+register_parser("pymupdf", PyMuPDFParser)
+register_parser("docling", DoclingParser)

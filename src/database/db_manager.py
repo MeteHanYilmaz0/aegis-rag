@@ -2,12 +2,13 @@ import sqlite3
 import os
 import re
 import threading
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
 import chromadb
 
 from src import config
+from src.contracts.embedder import get_embedder, OllamaEmbedder  # OllamaEmbedder: geriye uyumlu re-export
+from src.contracts.llm import get_llm
 
 # Projenin kök dizininde db klasörü oluşturma
 DB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "db"))
@@ -19,45 +20,6 @@ CHROMA_PATH = os.path.join(DB_DIR, "chroma_db")
 # Şema sürümü. Değiştiğinde (PRAGMA user_version uyuşmazsa) tablolar düşürülüp yeniden
 # kurulur ve belgelerin yeniden indekslenmesi gerekir (dev verisi).
 SCHEMA_VERSION = 2
-
-class OllamaEmbedder:
-    """
-    Ollama yerel embedding modeli (varsayılan: nomic-embed-text).
-
-    FAIL-FAST: Ollama/model erişilemezse SESSİZCE başka bir modele yedeklenmez.
-    Sessiz yedekleme, farklı boyutlu/uzaylı vektörlerin aynı koleksiyona karışmasına
-    ve arama sonuçlarının anlamsızlaşmasına yol açar. Bunun yerine açık hata fırlatır.
-
-    Görev ön-ekleri (task prefix): nomic-embed-text, dokümanlar için "search_document:",
-    sorgular için "search_query:" ön-eki bekler; bu ön-ekler retrieval kalitesini belirgin
-    artırır. Ön-ek gerektirmeyen modellerde (bge-m3 vb.) boş bırakılır.
-    """
-
-    def __init__(self, model: str = config.EMBED_MODEL, base_url: str = config.OLLAMA_URL):
-        self.model = model
-        self.base_url = base_url
-        uses_prefix = model.startswith("nomic")
-        self.doc_prefix = "search_document: " if uses_prefix else ""
-        self.query_prefix = "search_query: " if uses_prefix else ""
-
-    def _embed_one(self, text: str) -> List[float]:
-        response = requests.post(
-            f"{self.base_url}/api/embeddings",
-            json={"model": self.model, "prompt": text, "keep_alive": config.OLLAMA_KEEP_ALIVE},
-            timeout=config.EMBED_TIMEOUT,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Embedding modeli '{self.model}' yanıt vermedi (HTTP {response.status_code}). "
-                f"Ollama çalışıyor mu ve `ollama pull {self.model}` yapıldı mı kontrol edin."
-            )
-        return response.json()["embedding"]
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return [self._embed_one(self.doc_prefix + t) for t in texts]
-
-    def embed_query(self, text: str) -> List[float]:
-        return self._embed_one(self.query_prefix + text)
 
 
 class DBManager:
@@ -75,7 +37,8 @@ class DBManager:
         # ChromaDB yerel istemcisini başlat. Embedding'leri Chroma'ya elle veriyoruz
         # (query/doc ön-ekleri için), bu yüzden koleksiyona embedding_function bağlamıyoruz.
         self.chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-        self.embedder = OllamaEmbedder()
+        self.embedder = get_embedder()                       # sözleşme: BaseEmbedder
+        self._summary_llm = get_llm(config.SUMMARY_MODEL)    # sözleşme: BaseLLM (özet üretimi)
         self.chroma_collection = self._get_cosine_collection()
 
     def _get_cosine_collection(self):
@@ -91,10 +54,11 @@ class DBManager:
         Her iki durumda da belgelerin yeniden indekslenmesi gerekir (dev verisi).
         """
         name = config.CHROMA_COLLECTION
-        wanted = {"hnsw:space": "cosine", "embed_model": config.EMBED_MODEL}
+        key = self.embedder.model_key
+        wanted = {"hnsw:space": "cosine", "embed_model": key}
         col = self.chroma_client.get_or_create_collection(name=name, metadata=wanted)
         meta = col.metadata or {}
-        if meta.get("hnsw:space") != "cosine" or meta.get("embed_model") != config.EMBED_MODEL:
+        if meta.get("hnsw:space") != "cosine" or meta.get("embed_model") != key:
             self.chroma_client.delete_collection(name)
             col = self.chroma_client.get_or_create_collection(name=name, metadata=wanted)
         return col
@@ -163,20 +127,13 @@ class DBManager:
         return " ".join(sentences[:3]) if sentences else heading
 
     def _llm_summary(self, content: str, heading: str) -> str:
-        """LLM ile tek cümlelik nesnel özet. Hata olursa istisna fırlatır (çağıran yedekler)."""
+        """LLM (sözleşme) ile tek cümlelik nesnel özet. Hata olursa istisna fırlatır (çağıran yedekler)."""
         prompt = (
             "Aşağıdaki bölümü tek cümlede, Türkçe ve nesnel biçimde özetle. "
             "Sadece özeti yaz, başka açıklama ekleme.\n\n"
             f"BAŞLIK: {heading}\n\nMETİN:\n{content[:2000]}"
         )
-        response = requests.post(
-            f"{config.OLLAMA_URL}/api/generate",
-            json={"model": config.SUMMARY_MODEL, "prompt": prompt,
-                  "stream": False, "think": config.LLM_THINKING},
-            timeout=config.OLLAMA_GENERATE_TIMEOUT,
-        )
-        response.raise_for_status()
-        text = re.sub(r'<think>.*?</think>', '', response.json().get("response", ""), flags=re.DOTALL).strip()
+        text = self._summary_llm.generate(prompt).strip()
         if not text:
             raise RuntimeError("Boş özet")
         return text
