@@ -52,11 +52,19 @@ def check_ollama_status() -> bool:
         return False
 
 def clean_json_response(text: str) -> str:
-    """LLM'den gelen JSON yanıtı temizler (önce olası <think> bloğunu ayıklar)."""
+    """
+    LLM yanıtından JSON'u sağlam biçimde çeker (zayıf modeller için): <think> ayıkla,
+    kod bloğu varsa al, yoksa ilk '{' ile son '}' aralığını al, trailing virgülleri temizle.
+    """
     text = strip_think(text)
     match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL | re.IGNORECASE)
     if match:
-        return match.group(1)
+        text = match.group(1)
+    else:
+        s, e = text.find("{"), text.rfind("}")
+        if s != -1 and e > s:
+            text = text[s:e + 1]
+    text = re.sub(r",\s*([}\]])", r"\1", text)   # sonda kalan virgül: {..,} → {..}
     return text
 
 def calculate_approx_tokens(text: str) -> int:
@@ -86,6 +94,31 @@ def health_check():
         "ollama_connected": ollama_ok,
         "available_models": models
     }
+
+@app.get("/api/health/probe")
+def health_probe():
+    """
+    Seçili LLM + embedder'a birer mini çağrı atıp gecikme + hata durumunu döner
+    (kurulum/uyumluluk teşhisi). Model yükleme yavaş olabilir; bu uçtan bilinçli çağrılır.
+    """
+    import time as _t
+    result = {"llm": {"model": config.LLM_MODEL, "provider": config.LLM_PROVIDER},
+              "embedder": {"model": config.EMBED_MODEL, "provider": config.EMBED_PROVIDER}}
+    t0 = _t.perf_counter()
+    try:
+        out = get_llm(config.LLM_MODEL).generate("Yalnızca 'OK' yaz.", temperature=0.0)
+        result["llm"].update({"ok": True, "latency_s": round(_t.perf_counter() - t0, 2),
+                              "sample": (out or "")[:40]})
+    except Exception as e:
+        result["llm"].update({"ok": False, "error": str(e)})
+    t1 = _t.perf_counter()
+    try:
+        vec = db_manager.embedder.embed_query("test")
+        result["embedder"].update({"ok": True, "latency_s": round(_t.perf_counter() - t1, 2),
+                                   "dim": len(vec)})
+    except Exception as e:
+        result["embedder"].update({"ok": False, "error": str(e)})
+    return result
 
 @app.get("/api/documents/list")
 def list_documents():
@@ -236,13 +269,15 @@ def get_upload_progress(job_id: str):
 # ==========================================================================
 
 def _descent_prompt(query: str, frontier: List[Dict[str, Any]], heatmap: Dict[Any, float]) -> str:
+    # Adaptif: geniş seviyede (zayıf modeli boğmamak için) özetleri kısalt.
+    summ_len = 100 if len(frontier) > 15 else 200
     lines = []
     for n in frontier:
         nid = n["id"]
         score = heatmap.get(nid, heatmap.get(str(nid)))
         heat = f" [uyuşma %{score * 100:.0f}]" if score else ""
         kind = "alt-başlıkları var" if not n.get("is_leaf") else "yaprak"
-        summary = (n.get("summary") or "").strip().replace("\n", " ")[:200]
+        summary = (n.get("summary") or "").strip().replace("\n", " ")[:summ_len]
         lines.append(f"[ID:{nid}] {n['heading']} ({kind}){heat}\n    özet: {summary}")
     tree_text = "\n".join(lines)
     return f"""Sana bir belgenin bir seviyesindeki başlıklar (özetleriyle) ve bir kullanıcı sorusu verilecek.
@@ -265,12 +300,20 @@ YÖNERGELER:
 
 
 def _ask_descent(model_name: str, query: str, frontier: List[Dict[str, Any]], heatmap: Dict[Any, float]):
-    try:
-        raw = get_llm(model_name).generate(_descent_prompt(query, frontier, heatmap), temperature=0.0)
-        data = json.loads(clean_json_response(raw))
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+    """Descent JSON'unu ister; parse başarısızsa 1 kez onarım (json_mode + katı yönerge) dener."""
+    llm = get_llm(model_name)
+    base_prompt = _descent_prompt(query, frontier, heatmap)
+    for attempt in range(2):
+        prompt = base_prompt if attempt == 0 else (
+            base_prompt + "\n\nUYARI: Yanıtın SADECE geçerli JSON olmalı; açıklama/markdown/metin ekleme.")
+        try:
+            raw = llm.generate(prompt, temperature=0.0, json_mode=(attempt == 1))
+            data = json.loads(clean_json_response(raw))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
+    return None
 
 
 def _cap_frontier(frontier: List[Dict[str, Any]], heatmap: Dict[Any, float], cap: int = 25):
@@ -550,7 +593,12 @@ KURALLAR:
         "heatmap_scores": heatmap_scores,
         "trace": trace,
     }
-    return qa_prompt, meta
+    # Dayanıklılık: LLM tamamen çökerse bile kullanıcı eli boş dönmesin — en iyi pasajlar.
+    if context_blocks:
+        extractive = "**(LLM yanıtı üretilemedi — belgeden ilgili bölümler)**\n\n" + "\n\n".join(context_blocks[:3])
+    else:
+        extractive = "Belgede bu soruyla ilgili bilgi bulunamadı."
+    return qa_prompt, meta, extractive
 
 
 @app.post("/api/query")
@@ -558,13 +606,14 @@ def query_aegis(payload: QueryRequest):
     """Tam yanıt (JSON): boru hattı + tek seferde sentez."""
     if not check_ollama_status():
         raise HTTPException(status_code=503, detail="Yerel Ollama servisine bağlanılamadı.")
-    qa_prompt, meta = _build_query_context(payload.document_id, payload.query, payload.model_name)
+    qa_prompt, meta, extractive = _build_query_context(payload.document_id, payload.query, payload.model_name)
     try:
         candidate = get_llm(payload.model_name).generate(qa_prompt).strip()
-        answer = candidate if candidate else "Model boş yanıt döndürdü."
+        answer = candidate if candidate else extractive   # boş yanıt → extractive yedek
     except Exception as e:
-        answer = f"Sorgu işlenirken bir hata oluştu: {str(e)}"
-        meta["trace"].append(f"❌ **Hata:** {str(e)}")
+        # Sentez çökse bile kullanıcı eli boş dönmesin (zayıf-model dayanıklılığı).
+        meta["trace"].append(f"⚠️ **Sentez hatası → extractive yedeğe geçildi:** {str(e)}")
+        answer = extractive
     return {"answer": answer, **meta}
 
 
@@ -576,16 +625,19 @@ def query_aegis_stream(payload: QueryRequest):
     """
     if not check_ollama_status():
         raise HTTPException(status_code=503, detail="Yerel Ollama servisine bağlanılamadı.")
-    qa_prompt, meta = _build_query_context(payload.document_id, payload.query, payload.model_name)
+    qa_prompt, meta, extractive = _build_query_context(payload.document_id, payload.query, payload.model_name)
 
     llm = get_llm(payload.model_name)
 
     def generate():
         yield json.dumps(meta, ensure_ascii=False) + "\n"
+        produced = False
         try:
             for piece in llm.generate_stream(qa_prompt):
+                produced = True
                 yield piece
-        except Exception as e:
-            yield f"\n[Sentez hatası: {str(e)}]"
+        except Exception:
+            if not produced:            # hiç token gelmeden çöktüyse extractive yedek
+                yield extractive
 
     return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")

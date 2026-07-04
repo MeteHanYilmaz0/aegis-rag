@@ -1,10 +1,41 @@
 import unittest
 import os
 import sys
+import json
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.backend import main
+
+
+class TestResilience(unittest.TestCase):
+    def test_clean_json_without_codeblock(self):
+        self.assertEqual(json.loads(main.clean_json_response('cevap: {"a": 1,} son')), {"a": 1})
+
+    def test_clean_json_strips_think(self):
+        self.assertEqual(json.loads(main.clean_json_response('<think>düşün</think>{"a": 2}')), {"a": 2})
+
+    def test_ask_descent_repairs_bad_json(self):
+        # İlk yanıt bozuk → onarım denemesiyle 2. yanıt geçerli JSON döner.
+        class FakeLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def generate(self, prompt, temperature=None, json_mode=False):
+                self.calls += 1
+                return "bozuk çıktı" if self.calls == 1 else '{"select": [], "descend": [], "confidence": "LOW"}'
+
+        fake = FakeLLM()
+        orig = main.get_llm
+        main.get_llm = lambda m=None: fake
+        try:
+            data = main._ask_descent("x", "soru",
+                                     [{"id": 1, "heading": "h", "is_leaf": 1, "summary": ""}], {})
+        finally:
+            main.get_llm = orig
+        self.assertIsInstance(data, dict)
+        self.assertEqual(data["confidence"], "LOW")
+        self.assertEqual(fake.calls, 2)   # onarım denemesi yapıldı
 
 
 class TestDescentHelpers(unittest.TestCase):
