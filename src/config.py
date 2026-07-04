@@ -79,6 +79,10 @@ MAX_DESCENT_CALLS = 8
 # ısı-kapsamlı aramaya geçilir (boşa LLM çağrısını önler — model-agnostik hız).
 DESCENT_MIN_NODES = 25
 
+# Ablation (değerlendirme): "none" = tam motor; "flat_rag" = ağaç/descent kapalı, yalnız
+# global vektör top-k → sentez (saf RAG). Aegis vs saf RAG farkını ölçmek için (paper).
+ABLATION = os.getenv("AEGIS_ABLATION", "none")
+
 # --- Zaman aşımları (saniye) ---
 OLLAMA_HEALTH_TIMEOUT = 2.5
 OLLAMA_GENERATE_TIMEOUT = 60

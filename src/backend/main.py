@@ -42,6 +42,7 @@ class QueryRequest(BaseModel):
     document_id: int
     query: str
     model_name: str = config.LLM_MODEL
+    ablation: Optional[str] = None    # "flat_rag" → saf RAG modu (ölçüm/benchmark için)
 
 def check_ollama_status() -> bool:
     """Ollama servisinin ayakta olup olmadığını kontrol eder."""
@@ -426,6 +427,56 @@ def _should_run_descent(nodes):
     return len(nodes) >= config.DESCENT_MIN_NODES
 
 
+def _synthesis_prompt(query: str, final_context: str) -> str:
+    return f"""Sana bir belgeden seçilmiş bağlam (özetler + pasajlar) ve bir soru verilecek.
+Görevin, YALNIZCA bağlamdaki bilgilere dayanarak soruyu Türkçe ve doğrudan yanıtlamak.
+
+BAĞLAM:
+{final_context}
+
+SORU:
+"{query}"
+
+KURALLAR:
+1. Sadece bağlamdaki gerçekleri kullan; bağlamda olmayan bir şeyi UYDURMA.
+2. Bilgi bağlamda yoksa açıkça "Belgede bu bilgi bulunmuyor." de.
+3. Atıf yaptığın yeri parantez içinde belirt (bölüm yolu ve varsa sayfa).
+4. Doğrudan cevabı yaz; "bağlama göre", "yönergelere göre" gibi meta-ifadeleri kullanma.
+"""
+
+
+def _extractive_answer(context_blocks: List[str]) -> str:
+    """LLM tamamen çökerse bile kullanıcı eli boş dönmesin — en iyi pasajlar."""
+    if context_blocks:
+        return "**(LLM yanıtı üretilemedi — belgeden ilgili bölümler)**\n\n" + "\n\n".join(context_blocks[:3])
+    return "Belgede bu soruyla ilgili bilgi bulunamadı."
+
+
+def _flat_rag_context(query, reranked_hits, heatmap_scores, trace):
+    """
+    ABLATION="flat_rag": ağaç/descent kapalı, saf RAG — global vektör top-k pasajları → sentez.
+    Aegis vs saf RAG karşılaştırması için (paper). Aynı (qa_prompt, meta, extractive) döner.
+    """
+    blocks, tokens, budget = [], 0, config.TOKEN_BUDGET
+    for idx, res in enumerate(reranked_hits[:config.CONTEXT_PASSAGES]):
+        meta = res["metadata"]
+        page = meta.get("start_page")
+        page_str = f", s.{page}" if page and page != -1 else ""
+        block = f"--- Pasaj #{idx + 1} ({meta.get('path', 'Genel')}{page_str}) ---\n{res['content']}"
+        t = calculate_approx_tokens(block)
+        if tokens + t > budget:
+            break
+        blocks.append(block)
+        tokens += t
+    trace.append(f"🧪 **ABLATION (flat_rag):** ağaç/descent kapalı; {len(blocks)} global pasaj → sentez.")
+    meta = {
+        "selected_node_ids": [], "execution_policy": "Flat RAG (ablation)",
+        "fallback_triggered": True, "context_tokens": tokens,
+        "heatmap_scores": heatmap_scores, "trace": trace,
+    }
+    return _synthesis_prompt(query, "\n\n".join(blocks)), meta, _extractive_answer(blocks)
+
+
 def _subtree_ids(root_ids, children_map):
     """Verilen düğümler + tüm alt-ağaç (descendant) node_id kümesi (scoped arama kapsamı)."""
     out = set()
@@ -440,12 +491,13 @@ def _subtree_ids(root_ids, children_map):
     return out
 
 
-def _build_query_context(document_id: int, query: str, model_name: str):
+def _build_query_context(document_id: int, query: str, model_name: str, ablation: str = None):
     """
-    Retrieval + recursive descent + bağlam kurulumu; sentez prompt'unu ve meta'yı döndürür.
-    JSON (/api/query) ve streaming (/api/query/stream) endpoint'leri paylaşır.
-    Döner: (qa_prompt, meta).
+    Retrieval + recursive descent + bağlam kurulumu; sentez prompt'unu, meta'yı ve extractive
+    yedeği döndürür. JSON ve streaming endpoint'leri paylaşır. Döner: (qa_prompt, meta, extractive).
+    ablation="flat_rag" → ağaç/descent kapalı saf RAG (ölçüm).
     """
+    ablation = ablation or config.ABLATION
     nodes = db_manager.get_document_nodes(document_id)
     if not nodes:
         raise HTTPException(status_code=404, detail="Dokümana ait TOC ağacı bulunamadı.")
@@ -477,6 +529,10 @@ def _build_query_context(document_id: int, query: str, model_name: str):
         for n_id, scs in node_chunk_scores.items()
     }
     trace.append(f"🔥 **Semantik Isı Haritası:** {len(heatmap_scores)} düğüm pozitif eşleşme aldı.")
+
+    # ABLATION: saf RAG (ağaç/descent kapalı) — global pasajlarla doğrudan sentez
+    if ablation == "flat_rag":
+        return _flat_rag_context(query, scored_hits, heatmap_scores, trace)
 
     # ==========================================
     # 2. Recursive Descent (seviye seviye iniş)
@@ -567,22 +623,7 @@ def _build_query_context(document_id: int, query: str, model_name: str):
     # ==========================================
     # 4. Sentez (alıntılı, grounding; Self-NLI kaldırıldı)
     # ==========================================
-    final_context = "\n\n".join(context_blocks)
-    qa_prompt = f"""Sana bir belgeden seçilmiş bağlam (özetler + pasajlar) ve bir soru verilecek.
-Görevin, YALNIZCA bağlamdaki bilgilere dayanarak soruyu Türkçe ve doğrudan yanıtlamak.
-
-BAĞLAM:
-{final_context}
-
-SORU:
-"{query}"
-
-KURALLAR:
-1. Sadece bağlamdaki gerçekleri kullan; bağlamda olmayan bir şeyi UYDURMA.
-2. Bilgi bağlamda yoksa açıkça "Belgede bu bilgi bulunmuyor." de.
-3. Atıf yaptığın yeri parantez içinde belirt (bölüm yolu ve varsa sayfa).
-4. Doğrudan cevabı yaz; "bağlama göre", "yönergelere göre" gibi meta-ifadeleri kullanma.
-"""
+    qa_prompt = _synthesis_prompt(query, "\n\n".join(context_blocks))
     # UI vurgusu: yapısal hedefler varsa onları, yoksa ısı-zirvesini göster.
     selected = sorted(structural_roots) if structural_roots else sorted(heatmap_top)
     meta = {
@@ -593,12 +634,7 @@ KURALLAR:
         "heatmap_scores": heatmap_scores,
         "trace": trace,
     }
-    # Dayanıklılık: LLM tamamen çökerse bile kullanıcı eli boş dönmesin — en iyi pasajlar.
-    if context_blocks:
-        extractive = "**(LLM yanıtı üretilemedi — belgeden ilgili bölümler)**\n\n" + "\n\n".join(context_blocks[:3])
-    else:
-        extractive = "Belgede bu soruyla ilgili bilgi bulunamadı."
-    return qa_prompt, meta, extractive
+    return qa_prompt, meta, _extractive_answer(context_blocks)
 
 
 @app.post("/api/query")
@@ -606,7 +642,7 @@ def query_aegis(payload: QueryRequest):
     """Tam yanıt (JSON): boru hattı + tek seferde sentez."""
     if not check_ollama_status():
         raise HTTPException(status_code=503, detail="Yerel Ollama servisine bağlanılamadı.")
-    qa_prompt, meta, extractive = _build_query_context(payload.document_id, payload.query, payload.model_name)
+    qa_prompt, meta, extractive = _build_query_context(payload.document_id, payload.query, payload.model_name, payload.ablation)
     try:
         candidate = get_llm(payload.model_name).generate(qa_prompt).strip()
         answer = candidate if candidate else extractive   # boş yanıt → extractive yedek
@@ -625,7 +661,7 @@ def query_aegis_stream(payload: QueryRequest):
     """
     if not check_ollama_status():
         raise HTTPException(status_code=503, detail="Yerel Ollama servisine bağlanılamadı.")
-    qa_prompt, meta, extractive = _build_query_context(payload.document_id, payload.query, payload.model_name)
+    qa_prompt, meta, extractive = _build_query_context(payload.document_id, payload.query, payload.model_name, payload.ablation)
 
     llm = get_llm(payload.model_name)
 
